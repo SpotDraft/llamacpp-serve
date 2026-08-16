@@ -1,0 +1,15 @@
+flowchart LR
+    W["healthcheck.sh --watch<br/>every 5s"] --> P["curl --unix-socket sock /health"]
+    P --> D{"socket healthy?"}
+    D -->|yes| C["add server unix:/sockets/llama-N.sock"]
+    D -->|no| X["# llama-N DOWN"]
+    C --> CF["write upstream.conf.tmp"]
+    X --> CF
+    CF --> Z{"0 healthy?"}
+    Z -->|yes| PH["add placeholder<br/>server none.sock"]
+    Z -->|no| CH{"changed vs current?"}
+    PH --> CH
+    CH -->|yes| R["mv + nginx -s reload"]
+    CH -->|no| L["discard tmp, keep running"]
+    R --> W
+    L --> W

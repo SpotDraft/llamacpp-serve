@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "llamacpp/model.gguf",
+  "small_model": "llamacpp/model.gguf",
+  "provider": {
+    "llamacpp": {
+      "options": {
+        "baseURL": "https://localhost:11437/v1"
+      },
+      "models": {
+        "model.gguf": {
+          "name": "llama.cpp (local pool)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}

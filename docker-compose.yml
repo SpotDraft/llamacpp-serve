@@ -1,0 +1,194 @@
+name: llamacpp-serve
+
+x-llama-base: &llama-base
+  image: ghcr.io/ggml-org/llama.cpp:server-cuda
+  restart: unless-stopped
+  # Run as the host user so files created are not root-owned.
+  user: "1000:1000"
+  # Harden: no new privileges, drop all capabilities.
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  # GPU access via the NVIDIA CDI device (DGX Spark / GB10).
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: cdi
+            device_ids:
+              - nvidia.com/gpu=all
+            capabilities:
+              - gpu
+  # llama-server config via its LLAMA_ARG_* env vars.
+  # Router mode (no LLAMA_ARG_MODEL): every .gguf dropped into var/lib/llama/
+  # (mounted /models) is discovered at startup. A model loads into its own
+  # child llama-server process on first request and is LRU-evicted when
+  # --models-max is reached. All settings below are inherited by the children.
+  environment:
+    LLAMA_ARG_HOST: 0.0.0.0
+    LLAMA_ARG_PORT: "8080"
+    LLAMA_ARG_MODELS_DIR: /models
+    LLAMA_ARG_MODELS_MAX: "4"
+    LLAMA_ARG_CONTEXT_SIZE: "32768"
+    LLAMA_ARG_N_GPU_LAYERS: "999"
+    LLAMA_ARG_PARALLEL: "2"
+    # CUDA compute cache and any other writes go to this writable HOME.
+    HOME: /root
+  # Models are read-only; a separate writable dir covers /root so the
+  # non-root user can traverse it (image /root is mode 700 root).
+  volumes:
+    - ./var/lib/llama:/models:ro
+    - ./var/lib/llama-home:/root
+  networks:
+    - llama
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "100"
+
+x-socat-base: &socat-base
+  image: alpine/socat:latest
+  restart: unless-stopped
+  user: "1000:1000"
+  # Harden: no new privileges, drop all capabilities.
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  volumes:
+    - ./var/run/sockets:/sockets
+  networks:
+    - llama
+  depends_on:
+    - llama-1
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "5m"
+      max-file: "100"
+
+services:
+  llama-1:
+    <<: *llama-base
+
+  socat-1:
+    <<: *socat-base
+    command: UNIX-LISTEN:/sockets/llama-1.sock,unlink-early,fork,reuseaddr,mode=660 TCP:llama-1:8080
+    depends_on:
+      - llama-1
+
+  llama-2:
+    <<: *llama-base
+
+  socat-2:
+    <<: *socat-base
+    command: UNIX-LISTEN:/sockets/llama-2.sock,unlink-early,fork,reuseaddr,mode=660 TCP:llama-2:8080
+    depends_on:
+      - llama-2
+
+  webui:
+    build:
+      context: .
+      dockerfile: webui/Dockerfile
+    image: llamacpp-serve-webui
+    restart: unless-stopped
+    # Run as the host user so the SQLite DB and uploads are not root-owned.
+    user: "1000:1000"
+    # Harden: no new privileges, drop all capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Point at the nginx pool over TLS. 172.31.0.1 is the pinned bridge
+    # gateway -> the host, where nginx (host network) listens on 11437.
+    environment:
+      OPENAI_API_BASE_URL: https://172.31.0.1:11437/v1
+      # Public URL of this webui as seen by browsers (via nginx :11438).
+      WEBUI_URL: https://localhost:11438
+      # llama-server has no auth; open-webui needs a non-empty placeholder.
+      OPENAI_API_KEY: none
+      # Disable the bundled Ollama backend - llama.cpp is the only engine.
+      ENABLE_OLLAMA_API: "false"
+      # start.sh writes the secret key to the workdir (/app/backend, root-owned
+      # in the image); redirect it into our writable data mount.
+      WEBUI_SECRET_KEY_FILE: /app/backend/data/.webui_secret_key
+      # Use the system bundle (our CA baked in at build time) so httpx/
+      # requests verify the pool cert without breaking other TLS.
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+    # SQLite DB + uploads live in this host dir.
+    volumes:
+      - ./var/lib/webui:/app/backend/data
+    # No TCP ports published: the only path in is the unix socket bridged by
+    # socat-webui, which nginx :11438 (HTTPS) proxies to.
+    networks:
+      - llama
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "100"
+
+  socat-webui:
+    image: alpine/socat:latest
+    restart: unless-stopped
+    user: "1000:1000"
+    # Harden: no new privileges, drop all capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./var/run/sockets:/sockets
+    networks:
+      - llama
+    depends_on:
+      - webui
+    command: UNIX-LISTEN:/sockets/webui.sock,unlink-early,fork,reuseaddr,mode=660 TCP:webui:8080
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "100"
+
+  nginx:
+    image: nginx:latest
+    restart: unless-stopped
+    # Run as non-root.
+    user: "1000:1000"
+    # Write the initial upstream config, then keep nginx as PID 1 while the
+    # health-check watcher regenerates the upstream and reloads on changes.
+    command: >-
+      sh -c "/healthcheck.sh --init &&
+             (/healthcheck.sh --watch &) &&
+             exec /docker-entrypoint.sh nginx -g 'daemon off;'"
+    # Host networking so nginx sees real client IPs (ip_hash stickiness
+    # otherwise collapses to the docker bridge gateway IP).
+    network_mode: host
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/healthcheck.sh:/healthcheck.sh:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./var/run/sockets:/sockets:ro
+      - ./var/run/nginx:/etc/nginx/runtime
+    depends_on:
+      - socat-1
+      - socat-2
+      - socat-webui
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "100"
+
+networks:
+  llama:
+    # Pin a subnet so the bridge gateway (172.31.0.1) is deterministic.
+    # The webui uses this IP to reach nginx (host network) over TLS, and
+    # the server cert has it in its SANs.
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

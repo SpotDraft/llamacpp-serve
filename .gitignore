@@ -1,0 +1,29 @@
+# Docker and container mounts
+var/
+nginx/certs/
+*.sock
+*.log
+
+# CA Certificates
+ca-certificates.crt
+*.pem
+*.key
+*.crt
+*.csr
+*.der
+*.jks
+*.keystore
+
+# Docker
+docker-compose.override.yml
+
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

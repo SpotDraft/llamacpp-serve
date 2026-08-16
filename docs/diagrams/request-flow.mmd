@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    participant C as Client (curl / opencode)
+    participant N as nginx :11437 (TLS)
+    participant UP as llama_pool (ip_hash)
+    participant SC as socat unix socket
+    participant R as llama-server router
+    participant M as model files<br/>(var/lib/llama)
+    participant P as child llama-server<br/>(model X)
+
+    C->>N: POST /v1/chat/completions (TLS 1.3, local CA)
+    N->>UP: proxy_pass
+    UP->>SC: pick healthy router socket for client IP
+    SC->>R: TCP :8080
+    R->>R: route by "model" field
+    alt model X not loaded
+        R->>M: read GGUF, spawn child
+        M-->>R: model X loaded
+    end
+    R->>P: proxy to child
+    P-->>R: SSE stream
+    R-->>SC: stream
+    SC-->>UP: stream
+    UP-->>N: stream
+    N-->>C: SSE stream (proxy_buffering off)
