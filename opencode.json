@@ -1,15 +1,15 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "llamacpp/model.gguf",
-  "small_model": "llamacpp/model.gguf",
+  "model": "gemma-4-12B-it-Q4_K_M",
+  "small_model": "gemma-4-12B-it-Q4_K_M",
   "provider": {
     "llamacpp": {
       "options": {
         "baseURL": "https://localhost:11437/v1"
       },
       "models": {
-        "model.gguf": {
-          "name": "llama.cpp (local pool)",
+        "gemma-4-12B-it-Q4_K_M": {
+          "name": "Gemma 4 12B IT (Q4_K_M)",
           "tool_call": true,
           "reasoning": true,
           "limit": {

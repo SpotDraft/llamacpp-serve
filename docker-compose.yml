@@ -30,9 +30,10 @@ x-llama-base: &llama-base
     LLAMA_ARG_PORT: "8080"
     LLAMA_ARG_MODELS_DIR: /models
     LLAMA_ARG_MODELS_MAX: "4"
-    LLAMA_ARG_CONTEXT_SIZE: "32768"
+    LLAMA_ARG_CONTEXT_SIZE: "16384"
     LLAMA_ARG_N_GPU_LAYERS: "999"
     LLAMA_ARG_PARALLEL: "2"
+    LLAMA_ARG_FLASH_ATTN: "on"
     # CUDA compute cache and any other writes go to this writable HOME.
     HOME: /root
   # Models are read-only; a separate writable dir covers /root so the
