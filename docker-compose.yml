@@ -166,8 +166,8 @@ services:
       sh -c "/healthcheck.sh --init &&
              (/healthcheck.sh --watch &) &&
              exec /docker-entrypoint.sh nginx -g 'daemon off;'"
-    # Host networking so nginx sees real client IPs (ip_hash stickiness
-    # otherwise collapses to the docker bridge gateway IP).
+    # Host networking so nginx listens on the host's :11437/:11438 and the
+    # webui can reach the pool via the pinned bridge gateway (172.31.0.1).
     network_mode: host
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro

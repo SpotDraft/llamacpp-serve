@@ -40,9 +40,8 @@ the smoke tests from the README.
   router evicts independently) — total is bounded by GPU memory.
 - Two routers are kept for redundancy: the nginx health checker drops a
   restarting router from the pool, the other keeps serving, and its models
-  reload on demand. One model can be hot on both routers simultaneously (clients
-  pinned to different routers via `ip_hash`) — that temporarily doubles VRAM for
-  that model.
+  reload on demand. With round-robin balancing, a model can be hot on both
+  routers simultaneously — that temporarily doubles VRAM for that model.
 - Sharded/multi-file GGUFs are not auto-discovered; they need a presets INI
   (`LLAMA_ARG_MODELS_PRESET`) pointing at the first shard.
 

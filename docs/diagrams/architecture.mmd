@@ -6,7 +6,7 @@ flowchart TD
         subgraph NGX["nginx container - network_mode: host"]
             LS11437["<b>:11437</b> HTTPS - llama.cpp API"]
             LS11438["<b>:11438</b> HTTPS - Open WebUI"]
-            UP["upstream llama_pool (ip_hash)"]
+            UP["upstream llama_pool (round-robin)"]
             HK["healthcheck.sh<br/>probe every 5s + reload"]
             CERTS["TLS certs<br/>nginx/certs/"]
         end

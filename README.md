@@ -3,9 +3,8 @@
 A self-hosted, TLS-only [llama.cpp](https://github.com/ggml-org/llama.cpp) serving
 stack for a single GPU host (NVIDIA DGX Spark / GB10). It runs two `llama-server`
 instances in **router mode** behind an nginx reverse proxy with dynamic,
-health-checked upstreams and session stickiness, plus Open WebUI for a browser
-interface. Every path into the stack is HTTPS; nothing is published as plain
-HTTP.
+health-checked upstreams, plus Open WebUI for a browser interface. Every path
+into the stack is HTTPS; nothing is published as plain HTTP.
 
 ## Highlights
 
@@ -26,7 +25,8 @@ HTTP.
 - **Dynamic upstream pool** — `healthcheck.sh` probes each instance's socket
   every 5 s and regenerates the nginx upstream, reloading only on change. Failed
   instances are dropped from the pool automatically.
-- **Session stickiness** (`ip_hash`) so long conversations stay on one instance.
+- **Load-balanced routers** — nginx round-robins requests across the healthy
+  instances, sharing the load between the two routers.
 - **HTTPS-only entry points** on `:11437` (llama.cpp API) and `:11438` (Open WebUI),
   served by a self-signed local CA.
 - **Hardened containers** — non-root user (`1000:1000`), `no-new-privileges`,
@@ -52,9 +52,9 @@ HTTP.
 
 ![llama.cpp API request flow](docs/diagrams/request-flow.svg)
 
-A client calls `https://localhost:11437/v1`. nginx terminates TLS, selects a
-healthy socket for the client IP via `ip_hash`, and streams the response back
-with `proxy_buffering off` so SSE works end to end. Inside the chosen router,
+A client calls `https://localhost:11437/v1`. nginx terminates TLS, round-robins
+across the healthy sockets, and streams the response back with
+`proxy_buffering off` so SSE works end to end. Inside the chosen router,
 the `"model"` field in the request selects a model: if it is not loaded yet, the
 router spawns a child `llama-server` process for it (inheriting this stack's GPU
 access, context, and parallelism settings) and proxies the request to it.
@@ -144,7 +144,7 @@ Open the UI at <https://localhost:11438> (first-run: create the admin account).
 | `LLAMA_ARG_PARALLEL=2`                | compose `x-llama-base`        | Concurrent slots per loaded model (inherited) |
 | `LLAMA_ARG_MODELS_PRESET` (optional)  | compose `x-llama-base`        | Per-model config INI (context, aliases, sharded GGUFs) |
 | Number of instances (`1..2`)          | compose `services`            | Scale the router pool (and `INSTANCES` in `healthcheck.sh`) |
-| `ip_hash` / `keepalive 32`            | generated `upstream.conf`     | Stickiness + connection reuse            |
+| Round-robin / `keepalive 32`      | generated `upstream.conf`     | Load balancing + connection reuse |
 | `OPENAI_API_BASE_URL` / `WEBUI_URL`   | compose `webui`               | WebUI backend URL + public UI URL        |
 | Probe interval (`INTERVAL=5`)         | `nginx/healthcheck.sh`        | Health-check cadence                     |
 
