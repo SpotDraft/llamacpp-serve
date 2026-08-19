@@ -66,6 +66,11 @@ discovery:
 # Collapse request paths into low-cardinality route names. Anything not listed
 # falls back to the heuristic matcher, which is what stops Open WebUI's
 # /api/v1/chats/<uuid> style paths from exploding metric cardinality.
+#
+# These are path templates, not regexes: a segment placeholder is `{name}` or
+# `:name`, and a trailing `*` matches any prefix (so `/v1/*` would collapse the
+# whole OpenAI surface into one route). Literal paths, as used below, match
+# themselves.
 routes:
   unmatched: heuristic
   patterns:
@@ -94,5 +99,8 @@ routes:
     - /models/unload
     - /props
     - /slots
+    # Per-slot save/restore: template the id rather than leaving /slots/0,
+    # /slots/1, ... to the heuristic matcher.
+    - /slots/{id_slot}
     - /health
     - /metrics
