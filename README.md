@@ -258,6 +258,11 @@ llama.cpp's own Prometheus endpoint instead — enabled by
 `LLAMA_ENDPOINT_METRICS` (on by default) and pulled by the collector into the
 same pipeline as OBI's data.
 
+The endpoint is internal-only: nginx denies `/metrics` on `:11437`, so it is
+reachable from the `llama` network and from `docker compose exec`, but not
+through the front door. That is deliberate — see
+[Security notes](#security-notes).
+
 The scrape is **idle until you point it at something**: `LLAMA_SCRAPE_TARGETS`
 defaults to an empty list, which registers a scrape job with no targets — no
 requests, no log noise. Turn it on in `.env`:
@@ -412,6 +417,11 @@ workload.
   `otel/obi/config.yaml`.
 - **Collector exits with "at least one endpoint must be specified"** — you
   selected `forward.yaml` without setting `OTLP_FORWARD_ENDPOINT`.
+- **`403` from `https://localhost:11437/metrics`** — by design; nginx denies
+  that one location so engine metrics stay off the front door. Read them from
+  inside instead (`docker compose exec llama-1 curl -s
+  'http://localhost:8080/metrics?model=<id>&autoload=false'`) or let the
+  collector scrape them.
 - **No `llamacpp:*` metrics in the collector** — the scrape is opt-in: set
   `LLAMA_SCRAPE_TARGETS` *and* `LLAMA_SCRAPE_MODEL` in `.env`. If the target
   reports `up 0`, that model is not currently loaded on that router (scrapes
@@ -433,18 +443,13 @@ workload.
   *what OBI instruments*, but they do not reduce what it *could* reach. Enable
   the overlay only if you accept that trade-off; the base stack is unaffected
   when you don't. `collector` stays hardened like everything else.
-- `LLAMA_ENDPOINT_METRICS` is on by default and nginx proxies `location /`, so
-  `/metrics` is reachable through the front door at
-  `https://localhost:11437/metrics` (and the listener is not bound to loopback).
-  It exposes token counts and throughput, not prompts or completions, and the
-  inference API on the same port is already unauthenticated — so this widens
-  what an already-trusted caller can read rather than opening a new door. To
-  keep it internal-only anyway, deny it at the proxy and let the collector
-  scrape the routers directly:
-
-  ```nginx
-  location = /metrics { deny all; }   # in the :11437 server block
-  ```
+- `LLAMA_ENDPOINT_METRICS` is on by default, but **nginx denies `/metrics` on
+  `:11437`** so it never leaves the `llama` network. The listener is not bound
+  to loopback, so without that block anything able to reach the host could read
+  token counts and throughput. The collector scrapes the routers directly
+  instead, which is also the only way to get per-router numbers — round-robin
+  would send a scrape through the front door to an arbitrary router. Drop the
+  `location = /metrics` block from `nginx/nginx.conf` if you want it exposed.
 - Traces carry request metadata (routes, status codes, timings, and with
   `genai` enabled, LLM call attributes). Treat the collector's output as
   sensitive, and review `OTLP_FORWARD_ENDPOINT` before shipping it off-host.

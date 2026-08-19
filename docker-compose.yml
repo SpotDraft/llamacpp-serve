@@ -35,8 +35,9 @@ x-llama-base: &llama-base
     LLAMA_ARG_PARALLEL: "2"
     LLAMA_ARG_FLASH_ATTN: "on"
     # Prometheus /metrics on :8080, the engine-level view eBPF cannot see
-    # (KV-cache, slot occupancy, prompt vs generation throughput). Only ever
-    # reachable inside the `llama` network and through the nginx front door.
+    # (KV-cache, slot occupancy, prompt vs generation throughput). Reachable
+    # only inside the `llama` network: nginx denies /metrics on the front door,
+    # so the collector scrapes the routers here directly.
     # Set LLAMA_ENDPOINT_METRICS=false in .env to turn it off; llama.cpp only
     # honours truthy values (on/enabled/true/1), so "false" really disables it.
     LLAMA_ARG_ENDPOINT_METRICS: ${LLAMA_ENDPOINT_METRICS:-true}

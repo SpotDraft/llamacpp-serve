@@ -69,6 +69,10 @@ the smoke tests from the README.
 - The per-model child processes take an ephemeral port, so they are outside
   `open_ports: 8080` on purpose — instrumenting them would double-count the
   router -> child hop.
+- `nginx.conf` denies `location = /metrics` on `:11437` on purpose, so engine
+  metrics stay inside the `llama` network. Keep the exact-match form: a prefix
+  match would also swallow paths like `/metrics-foo`, and the collector needs
+  the endpoint reachable container-to-container, not through nginx.
 - Any scrape of a router's `/metrics` **must** pass `autoload=false`. Router mode
   loads a model on demand for a plain `GET /metrics?model=X`, so a recurring
   scrape without that guard pulls LRU-evicted models back into VRAM on a timer.
