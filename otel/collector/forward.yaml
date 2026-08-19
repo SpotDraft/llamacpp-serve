@@ -1,0 +1,81 @@
+# OpenTelemetry Collector — forwarding sink.
+#
+# Sends OBI's traces and metrics, plus llama.cpp's scraped engine metrics, on
+# to an external OTLP/HTTP backend (Tempo, Alloy, Grafana Cloud, Honeycomb,
+# another collector, ...).
+#
+# Enable by setting both of these in .env:
+#   COLLECTOR_CONFIG_FILE=/etc/collector/forward.yaml
+#   OTLP_FORWARD_ENDPOINT=https://otlp.example.internal:4318
+
+receivers:
+  # OBI's eBPF telemetry arrives here.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # llama.cpp's own engine metrics. Identical to the local.yaml job — see the
+  # comments there for why ?model= and autoload=false are both required, and
+  # why an unset LLAMA_SCRAPE_TARGETS leaves this idle instead of failing.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: llama-cpp
+          scrape_interval: ${env:LLAMA_SCRAPE_INTERVAL}
+          metrics_path: /metrics
+          params:
+            model: ["${env:LLAMA_SCRAPE_MODEL}"]
+            autoload: ["false"]
+          static_configs:
+            - targets: ${env:LLAMA_SCRAPE_TARGETS}
+
+processors:
+  # Shed telemetry rather than compete with the GPU workload for memory.
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  debug:
+    verbosity: ${env:COLLECTOR_DEBUG_VERBOSITY}
+  otlphttp:
+    endpoint: ${env:OTLP_FORWARD_ENDPOINT}
+    compression: gzip
+    # Authenticated backends: uncomment and set OTLP_FORWARD_AUTHORIZATION in
+    # .env (e.g. "Bearer <token>", or "Basic <base64 user:token>"). Left out by
+    # default because an empty Authorization header is rejected by some
+    # backends outright.
+    # headers:
+    #   authorization: ${env:OTLP_FORWARD_AUTHORIZATION}
+    tls:
+      # The backend's CA must be trusted by the collector image. Set
+      # OTLP_FORWARD_INSECURE_SKIP_VERIFY=true in .env for a self-signed
+      # backend you cannot add a CA for.
+      insecure_skip_verify: ${env:OTLP_FORWARD_INSECURE_SKIP_VERIFY}
+    # Survive a backend restart without losing the in-flight buffer.
+    retry_on_failure:
+      enabled: true
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+
+service:
+  telemetry:
+    logs:
+      level: ${env:COLLECTOR_LOG_LEVEL}
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, otlphttp]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [debug, otlphttp]

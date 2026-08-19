@@ -10,6 +10,16 @@ mkdir -p var/run/sockets
 mkdir -p var/run/nginx
 echo "Directories created successfully."
 
+# Seed .env from the template. Never overwrite an existing one — it is the
+# only file holding local settings (and possibly a backend token).
+echo "Checking .env..."
+if [ ! -f .env ]; then
+    cp .env.example .env
+    echo ".env created from .env.example (all optional features off)."
+else
+    echo ".env already exists, leaving it alone."
+fi
+
 # Create nginx/certs directory for certificates
 echo "Creating nginx/certs directory..."
 mkdir -p nginx/certs

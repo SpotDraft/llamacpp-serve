@@ -1,0 +1,119 @@
+# Optional OpenTelemetry plane for llamacpp-serve.
+#
+# Two components, each namespaced under otel/:
+#   otel/obi/        OBI — the eBPF provider that produces the telemetry
+#   otel/collector/  the collector that receives it, scrapes llama.cpp's own
+#                    /metrics, and routes both onward
+#
+# This file is purely additive: it adds two services and one network, and
+# changes nothing in docker-compose.yml. The base stack runs identically with
+# or without it. It is an overlay, not a standalone file — the `llama` network
+# it attaches the collector to is defined in docker-compose.yml.
+#
+# Enable it by uncommenting COMPOSE_FILE in .env, or ad hoc with:
+#   docker compose -f docker-compose.yml -f docker-compose.otel.yml up -d
+#
+# Disable it by re-commenting COMPOSE_FILE and running `docker compose down`
+# once with the overlay still active, so the containers are removed.
+#
+# See the "eBPF telemetry (optional)" section of README.md.
+
+x-otel-logging: &otel-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "100"
+
+services:
+  # Receives OTLP from OBI, optionally scrapes the routers' Prometheus
+  # /metrics, and fans both out. Which pipeline runs is chosen by
+  # COLLECTOR_CONFIG_FILE (see otel/collector/local.yaml and forward.yaml).
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.158.0
+    restart: unless-stopped
+    # Same posture as the rest of the stack: non-root, no capabilities.
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["--config=${COLLECTOR_CONFIG_FILE:-/etc/collector/local.yaml}"]
+    environment:
+      # Referenced as ${env:...} by the collector configs, so they must always
+      # be set, even when unused by the selected config.
+      COLLECTOR_LOG_LEVEL: ${COLLECTOR_LOG_LEVEL:-info}
+      COLLECTOR_DEBUG_VERBOSITY: ${COLLECTOR_DEBUG_VERBOSITY:-basic}
+      OTLP_FORWARD_ENDPOINT: ${OTLP_FORWARD_ENDPOINT:-}
+      OTLP_FORWARD_AUTHORIZATION: ${OTLP_FORWARD_AUTHORIZATION:-}
+      OTLP_FORWARD_INSECURE_SKIP_VERIFY: ${OTLP_FORWARD_INSECURE_SKIP_VERIFY:-false}
+      # llama.cpp engine-metrics scrape. Empty target list = a registered
+      # scrape job with nothing to scrape, which is why this is silent and
+      # free until you fill it in.
+      LLAMA_SCRAPE_TARGETS: ${LLAMA_SCRAPE_TARGETS:-[]}
+      LLAMA_SCRAPE_MODEL: ${LLAMA_SCRAPE_MODEL:-}
+      LLAMA_SCRAPE_INTERVAL: ${LLAMA_SCRAPE_INTERVAL:-15s}
+    volumes:
+      - ./otel/collector:/etc/collector:ro
+    # No published ports: OBI reaches the collector by service name on the
+    # otel network, matching the base stack's "nothing on the host" rule.
+    # It also joins `llama` so it can scrape llama-1:8080 / llama-2:8080 —
+    # that pull is the one thing here that needs network access to the stack.
+    networks:
+      - otel
+      - llama
+    # Cap the collector so telemetry can never starve the GPU workload; the
+    # memory_limiter in the collector config sheds load below this ceiling.
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    logging: *otel-logging
+
+  # Zero-code instrumentation. Attaches eBPF probes to the already-running
+  # llama-server / nginx / webui processes; none of them are modified or
+  # restarted.
+  obi:
+    image: otel/ebpf-instrument:v0.10.0
+    restart: unless-stopped
+    # Loading eBPF programs and reading other containers' /proc and memory
+    # maps needs broad privileges. This is what OBI's own docs and examples
+    # use, and it is the one service in this stack that is not hardened —
+    # see README "Security notes" before enabling.
+    privileged: true
+    # Required: without the host PID namespace OBI only sees its own process
+    # and discovers nothing.
+    pid: host
+    command: ["--config=/etc/obi/config.yaml"]
+    environment:
+      # Where to send data. Defaults to the collector above; point it straight
+      # at your own OTLP endpoint to skip the collector entirely.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OBI_OTLP_ENDPOINT:-http://collector:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OBI_OTLP_PROTOCOL:-http/protobuf}
+      # Env vars override otel/obi/config.yaml, so these are the live knobs.
+      OTEL_EBPF_LOG_LEVEL: ${OBI_LOG_LEVEL:-INFO}
+      OTEL_EBPF_METRICS_FEATURES: ${OBI_METRICS_FEATURES:-application,application_span,application_service_graph}
+      # Only the protocols this stack actually speaks. Each entry attaches
+      # more probes, so listing them beats the "*" default on a GPU host.
+      # Nothing here speaks gRPC (llama-server, nginx and uvicorn are all
+      # plain HTTP), so it is left out.
+      OTEL_EBPF_METRICS_INSTRUMENTATIONS: ${OBI_METRICS_INSTRUMENTATIONS:-http,genai,gpu}
+      OTEL_EBPF_TRACES_INSTRUMENTATIONS: ${OBI_TRACES_INSTRUMENTATIONS:-http,genai}
+      # Set to "text" to dump spans into the container log — the quickest way
+      # to confirm OBI is seeing traffic.
+      OTEL_EBPF_TRACE_PRINTER: ${OBI_TRACE_PRINTER:-disabled}
+      # When true OBI exits if a required capability is missing instead of
+      # continuing with reduced functionality.
+      OTEL_EBPF_ENFORCE_SYS_CAPS: ${OBI_ENFORCE_SYS_CAPS:-false}
+    volumes:
+      - ./otel/obi/config.yaml:/etc/obi/config.yaml:ro
+    networks:
+      - otel
+    depends_on:
+      - collector
+    logging: *otel-logging
+
+networks:
+  # Dedicated telemetry network. OBI observes the stack through the kernel,
+  # not the network, so it never needs to join the `llama` bridge.
+  otel:
+    driver: bridge

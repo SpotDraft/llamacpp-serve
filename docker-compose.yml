@@ -34,6 +34,12 @@ x-llama-base: &llama-base
     LLAMA_ARG_N_GPU_LAYERS: "999"
     LLAMA_ARG_PARALLEL: "2"
     LLAMA_ARG_FLASH_ATTN: "on"
+    # Prometheus /metrics on :8080, the engine-level view eBPF cannot see
+    # (KV-cache, slot occupancy, prompt vs generation throughput). Only ever
+    # reachable inside the `llama` network and through the nginx front door.
+    # Set LLAMA_ENDPOINT_METRICS=false in .env to turn it off; llama.cpp only
+    # honours truthy values (on/enabled/true/1), so "false" really disables it.
+    LLAMA_ARG_ENDPOINT_METRICS: ${LLAMA_ENDPOINT_METRICS:-true}
     # CUDA compute cache and any other writes go to this writable HOME.
     HOME: /root
   # Models are read-only; a separate writable dir covers /root so the

@@ -17,6 +17,9 @@ ca-certificates.crt
 # Docker
 docker-compose.override.yml
 
+# Local settings (may contain OTLP backend tokens). .env.example is tracked.
+.env
+
 # System files
 .DS_Store
 Thumbs.db

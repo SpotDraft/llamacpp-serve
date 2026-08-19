@@ -1,0 +1,98 @@
+# OpenTelemetry eBPF Instrumentation (OBI) — llamacpp-serve
+#
+# Structure lives here; the tunable knobs live in .env and reach OBI as
+# OTEL_EBPF_* / OTEL_EXPORTER_OTLP_* environment variables, which take
+# precedence over anything set in this file.
+#
+# Reference: https://opentelemetry.io/docs/zero-code/obi/configure/options/
+
+# Where telemetry goes. OBI refuses to start unless at least one exporter is
+# defined, so these stay in the file rather than living only in compose env —
+# it keeps the config valid on its own and makes the destination readable here.
+# OTEL_EXPORTER_OTLP_ENDPOINT from .env overrides both at runtime.
+otel_traces_export:
+  endpoint: http://collector:4318
+otel_metrics_export:
+  endpoint: http://collector:4318
+
+# OBI runs with `pid: host`, so it can see every process on the box. These
+# selectors are the only thing keeping it scoped to this stack: each one
+# matches a listening port *and* requires the process to be containerised, so
+# host daemons and unrelated containers are never instrumented.
+#
+# Unlike in the sibling ollama-serve stack, the port alone is not enough here:
+# the llama.cpp routers and the webui both listen on 8080. `exe_path` (a glob
+# over the executable path) is the discriminator — every selector inside one
+# entry must match for a process to be instrumented.
+discovery:
+  instrument:
+    # llama.cpp routers. Each listens on 8080 inside its own network
+    # namespace, so one selector covers the whole pool; individual routers are
+    # told apart by the service.instance.id attribute.
+    #
+    # Only the routers match. The per-model child processes a router spawns
+    # take an ephemeral free port, so they fall outside `open_ports: 8080` —
+    # which is what we want: one span per request at the pool's front door,
+    # and no second span for the internal router -> child hop.
+    - name: llama
+      namespace: llamacpp-serve
+      open_ports: 8080
+      exe_path: "*/llama-server"
+      containers_only: true
+
+    # nginx, the TLS front door: 11437 (llama.cpp API) and 11438 (Open WebUI).
+    # It runs with network_mode: host, so these are host ports.
+    - name: nginx
+      namespace: llamacpp-serve
+      open_ports: 11437,11438
+      containers_only: true
+
+    # Open WebUI (Python/uvicorn), reachable only via socat + nginx. Its
+    # start.sh ends in `exec $PYTHON_CMD -m uvicorn`, so the executable is the
+    # interpreter — which is what separates it from the routers on port 8080.
+    - name: open-webui
+      namespace: llamacpp-serve
+      open_ports: 8080
+      exe_path: "*/python*"
+      containers_only: true
+
+  # socat only shuttles bytes between a unix socket and TCP. It listens on unix
+  # sockets rather than TCP ports so it is not matched above, but exclude it
+  # explicitly so a future TCP-LISTEN socat can't double-count requests that
+  # are already recorded on both nginx and the routers.
+  exclude_instrument:
+    - exe_path: "*/socat"
+
+# Collapse request paths into low-cardinality route names. Anything not listed
+# falls back to the heuristic matcher, which is what stops Open WebUI's
+# /api/v1/chats/<uuid> style paths from exploding metric cardinality.
+routes:
+  unmatched: heuristic
+  patterns:
+    # OpenAI-compatible API (what opencode.json and most clients target)
+    - /v1/chat/completions
+    - /v1/completions
+    - /v1/embeddings
+    - /v1/rerank
+    - /v1/responses
+    - /v1/messages
+    - /v1/models
+    # llama.cpp native API
+    - /completion
+    - /completions
+    - /chat/completions
+    - /infill
+    - /embedding
+    - /embeddings
+    - /rerank
+    - /tokenize
+    - /detokenize
+    - /apply-template
+    # Router and operational endpoints
+    - /models
+    - /models/load
+    - /models/unload
+    - /props
+    - /slots
+    - /health
+    - /metrics

@@ -1,0 +1,81 @@
+# OpenTelemetry Collector — local sink (default).
+#
+# Everything stays on this host:
+#   debug      -> span/metric counts in `docker compose logs collector`
+#                 (set COLLECTOR_DEBUG_VERBOSITY=detailed in .env for payloads)
+#   prometheus -> scrape endpoint at collector:8889/metrics on the otel network
+#
+# To ship the same data to an external backend instead, point
+# COLLECTOR_CONFIG_FILE at forward.yaml in .env.
+
+receivers:
+  # OBI's eBPF telemetry arrives here.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # llama.cpp's own engine metrics, which eBPF cannot see: KV-cache usage,
+  # slot occupancy, prompt vs generation token throughput. Pulled rather than
+  # pushed, because llama-server only speaks Prometheus.
+  #
+  # Idle by default: LLAMA_SCRAPE_TARGETS defaults to an empty list, and a
+  # scrape job with no targets never fires and logs nothing. Set the targets
+  # and LLAMA_SCRAPE_MODEL in .env to turn it on.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: llama-cpp
+          scrape_interval: ${env:LLAMA_SCRAPE_INTERVAL}
+          metrics_path: /metrics
+          params:
+            # The routers run in router mode, where /metrics is proxied to a
+            # model's child process and so requires ?model=<id>. Without it
+            # the router answers 400 "model name is missing from the request".
+            model: ["${env:LLAMA_SCRAPE_MODEL}"]
+            # Never let a scrape load a model. On the router, GET /metrics
+            # calls ensure_model_ready() whenever autoload is on (the default),
+            # so a recurring scrape would pull an LRU-evicted model back into
+            # VRAM behind your back. With autoload=false an unloaded model
+            # answers 400 "model is not loaded" and nothing is loaded.
+            autoload: ["false"]
+          static_configs:
+            - targets: ${env:LLAMA_SCRAPE_TARGETS}
+
+processors:
+  # Shed telemetry rather than compete with the GPU workload for memory.
+  # Absolute limits, not percentages: on a large-memory host a percentage
+  # limit is so high it would never engage.
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  debug:
+    verbosity: ${env:COLLECTOR_DEBUG_VERBOSITY}
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Surface service.name / service.instance.id as labels so the two routers
+    # are distinguishable in the scrape output.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  telemetry:
+    logs:
+      level: ${env:COLLECTOR_LOG_LEVEL}
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [debug, prometheus]

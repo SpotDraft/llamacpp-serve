@@ -1,0 +1,30 @@
+flowchart TD
+    subgraph HOST["DGX Spark host (Ubuntu)"]
+        subgraph BASE["Base stack - unmodified, never restarted to enable OBI"]
+            NGX["nginx<br/>:11437 / :11438"]
+            L1["llama-1 router<br/>:8080 + /metrics"]
+            L2["llama-2 router<br/>:8080 + /metrics"]
+            W["webui<br/>:8080"]
+            SOC["socat bridges<br/>excluded - unix sockets, no TCP listener"]
+        end
+
+        KERNEL["Linux kernel - eBPF probes attached to the<br/>already-running processes: RED metrics + spans"]
+
+        subgraph OVERLAY["docker-compose.otel.yml - optional, purely additive"]
+            subgraph OBINET["bridge network otel - nothing published on the host"]
+                OBI["obi<br/>privileged + pid: host<br/>otel/obi/config.yaml"]
+                OC["collector<br/>OTLP :4317 / :4318"]
+            end
+        end
+    end
+
+    LOCAL["local.yaml (default)<br/>debug logs + Prometheus :8889"]
+    FWD["forward.yaml<br/>external OTLP/HTTP backend"]
+
+    NGX & L1 & L2 & W ==> KERNEL
+    KERNEL ==>|"discovery: open_ports + exe_path + containers_only"| OBI
+    OBI ==>|"OTLP/HTTP<br/>to collector:4318"| OC
+    OC -.->|"opt-in scrape of<br/>/metrics over the<br/>llama network"| L1
+    OC -.-> L2
+    OC --> LOCAL
+    OC -.->|"OTLP_FORWARD_ENDPOINT"| FWD

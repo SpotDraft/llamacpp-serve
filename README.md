@@ -33,6 +33,11 @@ into the stack is HTTPS; nothing is published as plain HTTP.
   and `cap_drop: ALL` on every service.
 - **No TCP ports published** except through nginx: containers talk over unix
   sockets bridged by socat.
+- **Optional eBPF telemetry** — opt-in OpenTelemetry traces and metrics for the
+  whole stack via [OBI](https://opentelemetry.io/docs/zero-code/obi/), with no
+  code changes and no restarts, next to llama.cpp's own Prometheus `/metrics`
+  for the engine-level view. Off by default; see
+  [eBPF telemetry](#ebpf-telemetry-optional).
 
 ## Architecture
 
@@ -85,6 +90,14 @@ the upstream keeps a placeholder `none.sock` so nginx stays valid.
 
 ```
 ├── docker-compose.yml      # The whole stack
+├── docker-compose.otel.yml # Optional telemetry overlay (off by default)
+├── .env.example            # Optional settings; setup.sh copies it to .env
+├── otel/
+│   ├── obi/
+│   │   └── config.yaml     # What OBI instruments + route names
+│   └── collector/
+│       ├── local.yaml      # Default pipeline: stays on this host
+│       └── forward.yaml    # Relay to an external OTLP/HTTP backend
 ├── nginx/
 │   ├── nginx.conf          # :11437 pool + :11438 webui, TLS-only
 │   ├── healthcheck.sh      # Dynamic upstream watcher
@@ -139,7 +152,7 @@ Open the UI at <https://localhost:11438> (first-run: create the admin account).
 | ------------------------------------- | ----------------------------- | ---------------------------------------- |
 | `LLAMA_ARG_MODELS_DIR=/models`        | compose `x-llama-base`        | Directory scanned for `.gguf` models (router mode) |
 | `LLAMA_ARG_MODELS_MAX=4`              | compose `x-llama-base`        | Max models resident at once per router (LRU eviction) |
-| `LLAMA_ARG_CONTEXT_SIZE=32768`        | compose `x-llama-base`        | Context window inherited by every loaded model |
+| `LLAMA_ARG_CONTEXT_SIZE=16384`        | compose `x-llama-base`        | Context window inherited by every loaded model |
 | `LLAMA_ARG_N_GPU_LAYERS=999`          | compose `x-llama-base`        | Offload all layers to the GPU (inherited) |
 | `LLAMA_ARG_PARALLEL=2`                | compose `x-llama-base`        | Concurrent slots per loaded model (inherited) |
 | `LLAMA_ARG_MODELS_PRESET` (optional)  | compose `x-llama-base`        | Per-model config INI (context, aliases, sharded GGUFs) |
@@ -147,10 +160,196 @@ Open the UI at <https://localhost:11438> (first-run: create the admin account).
 | Round-robin / `keepalive 32`      | generated `upstream.conf`     | Load balancing + connection reuse |
 | `OPENAI_API_BASE_URL` / `WEBUI_URL`   | compose `webui`               | WebUI backend URL + public UI URL        |
 | Probe interval (`INTERVAL=5`)         | `nginx/healthcheck.sh`        | Health-check cadence                     |
+| `LLAMA_ENDPOINT_METRICS=true`         | `.env` -> compose `x-llama-base` | llama.cpp's Prometheus `/metrics` endpoint |
+| Everything under `OBI_*`, `COLLECTOR_*`, `LLAMA_SCRAPE_*` | `.env`   | eBPF telemetry + engine-metric scrape, see below |
 
 With two routers, up to `2 x LLAMA_ARG_MODELS_MAX` models can be resident at
 once across the pool (each router LRU-evicts independently). The total is
 bounded by GPU memory.
+
+## eBPF telemetry (optional)
+
+[OpenTelemetry eBPF Instrumentation](https://opentelemetry.io/docs/zero-code/obi/)
+(OBI) attaches kernel probes to the processes already running in this stack and
+emits OTLP traces and metrics from them. Nothing in the base stack is modified,
+rebuilt, or restarted to enable it — the routers, nginx and the webui are
+unaware they are being observed.
+
+It is **off by default**. All of it lives in `docker-compose.otel.yml`, which is
+purely additive: the base stack behaves identically whether or not the overlay
+is loaded.
+
+![eBPF telemetry flow](docs/diagrams/otel-flow.svg)
+
+Note the direction of the arrows. OBI never talks to the base stack over the
+network — it observes through the kernel and only *emits* over the network. The
+one exception is the dashed edge: the optional Prometheus scrape of llama.cpp's
+own `/metrics`, which is a pull and therefore does need network access.
+
+### Enabling it
+
+```sh
+cp .env.example .env      # setup.sh already does this
+```
+
+Uncomment this one line in `.env`:
+
+```sh
+COMPOSE_FILE=docker-compose.yml:docker-compose.otel.yml
+```
+
+Then bring the stack up as usual — `obi` and `collector` join it:
+
+```sh
+docker compose up -d
+```
+
+To try it without touching `.env`:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.otel.yml up -d
+```
+
+### Disabling it
+
+Remove the two containers **before** unloading the overlay, otherwise Compose
+forgets they exist and leaves them running:
+
+```sh
+docker compose down
+```
+
+Then re-comment `COMPOSE_FILE` in `.env` and `docker compose up -d`.
+
+### What gets instrumented
+
+Selectors live in `otel/obi/config.yaml`. OBI runs with `pid: host`, so it can
+see every process on the machine; the selectors are what keep it scoped to this
+stack. Each one requires a **listening port** *and* `containers_only: true`, so
+host daemons and unrelated containers are never touched.
+
+Port alone is ambiguous here — the routers and the webui both listen on 8080 —
+so those two entries add an `exe_path` glob. Every selector inside one entry
+must match for a process to be instrumented.
+
+| Service         | Matched on                       | Reported as                                      |
+| --------------- | -------------------------------- | ------------------------------------------------ |
+| `llama-1/2`     | port 8080 + `*/llama-server`     | `llama` — routers split by `service.instance.id`  |
+| `nginx`         | ports 11437, 11438               | `nginx`                                          |
+| `webui`         | port 8080 + `*/python*`          | `open-webui`                                     |
+| model children  | —                                | not matched: they take an ephemeral port, so the router -> child hop is not counted twice |
+| `socat-*`       | —                                | excluded (it only shuttles bytes, and would double-count) |
+
+Both routers listen on 8080 inside their own network namespaces, so a single
+selector covers the pool and `service.instance.id` distinguishes them — which is
+usually what you want from a load-balanced pool.
+
+Request paths are collapsed into low-cardinality route names. The
+OpenAI-compatible, llama.cpp-native and router endpoints are listed explicitly
+in `routes.patterns`; everything else (notably Open WebUI's
+`/api/v1/chats/<uuid>` paths) falls back to OBI's heuristic matcher so metric
+cardinality stays bounded.
+
+### Scraping llama.cpp's engine metrics
+
+eBPF sees requests at the HTTP boundary. It cannot see *inside* the engine, so
+KV-cache usage, slot occupancy and prompt-vs-generation throughput come from
+llama.cpp's own Prometheus endpoint instead — enabled by
+`LLAMA_ENDPOINT_METRICS` (on by default) and pulled by the collector into the
+same pipeline as OBI's data.
+
+The scrape is **idle until you point it at something**: `LLAMA_SCRAPE_TARGETS`
+defaults to an empty list, which registers a scrape job with no targets — no
+requests, no log noise. Turn it on in `.env`:
+
+```sh
+LLAMA_SCRAPE_TARGETS=["llama-1:8080","llama-2:8080"]
+LLAMA_SCRAPE_MODEL=Qwen3-8B-Q4_K_M
+```
+
+`LLAMA_SCRAPE_MODEL` is required, and two details about it are worth knowing:
+
+- **Router mode makes `/metrics` per-model.** The router proxies `/metrics` to a
+  model's child process, so the request must carry `?model=<id>` — the GGUF
+  filename without the extension, exactly as in `GET /v1/models`. Without it the
+  router answers `400 model name is missing from the request`.
+- **Scrapes pass `autoload=false`, deliberately.** On the router a plain
+  `GET /metrics?model=X` *loads* X if it is not resident, because autoload is on
+  by default. A recurring scrape would therefore drag LRU-evicted models back
+  into VRAM on a timer. With `autoload=false` an unloaded model answers
+  `400 model is not loaded` and the target simply reports `up 0`.
+
+One model per collector, since the query parameter is per scrape job. For
+several at once, add a `static_configs` entry per model in
+`otel/collector/*.yaml` and let the `__param_model` label override the shared
+default:
+
+```yaml
+static_configs:
+  - targets: [llama-1:8080, llama-2:8080]
+    labels: { __param_model: Qwen3-8B-Q4_K_M }
+  - targets: [llama-1:8080, llama-2:8080]
+    labels: { __param_model: gemma-3-4b-it-Q8_0 }
+```
+
+### Where the data goes
+
+OBI exports OTLP to the bundled collector on a dedicated `otel` bridge network.
+Nothing is published on the host. The collector also joins the base stack's
+`llama` network, which is what lets it reach `llama-1:8080` for the scrape above.
+`COLLECTOR_CONFIG_FILE` in `.env` picks the pipeline:
+
+| Config                          | Behaviour                                                      |
+| ------------------------------- | -------------------------------------------------------------- |
+| `otel/collector/local.yaml` (default) | Stays on the box: span/metric counts in `docker compose logs collector`, plus a Prometheus scrape endpoint at `collector:8889/metrics` on the `otel` network |
+| `otel/collector/forward.yaml`   | Relays traces and metrics to the OTLP/HTTP backend in `OTLP_FORWARD_ENDPOINT` |
+
+To skip the collector entirely, point `OBI_OTLP_ENDPOINT` straight at your own
+OTLP endpoint. Note that the engine-metric scrape lives *in* the collector, so
+bypassing it means giving up that half of the picture.
+
+### Checking it works
+
+```sh
+docker compose logs obi | head -20
+```
+
+`starting Application Observability mode` means OBI loaded its probes. To watch
+actual spans, set `OBI_TRACE_PRINTER=text` in `.env`, `docker compose up -d obi`,
+send a request through `https://localhost:11437`, then:
+
+```sh
+docker compose logs -f obi
+```
+
+Set it back to `disabled` when you're done — it prints every span.
+
+llama.cpp's own metrics, straight from a router (needs a loaded model):
+
+```sh
+docker compose exec llama-1 curl -s 'http://localhost:8080/metrics?model=Qwen3-8B-Q4_K_M&autoload=false'
+```
+
+Scrape the collector's Prometheus endpoint. It is not published on the host, and
+the collector image has no shell, so do it from a throwaway container on the
+`otel` network — `alpine/socat` is already part of the stack, so nothing new is
+pulled:
+
+```sh
+docker run --rm --network llamacpp-serve_otel --entrypoint wget alpine/socat -qO- http://collector:8889/metrics
+```
+
+Everything OBI produces is there, and once `LLAMA_SCRAPE_TARGETS` is set, so are
+the `llamacpp:*` families and an `up` series per target.
+
+### Cost
+
+`OBI_METRICS_INSTRUMENTATIONS` and `OBI_TRACES_INSTRUMENTATIONS` default to just
+the protocols this stack speaks (`http`, `genai`, `gpu`) rather than OBI's `*`,
+since every extra entry attaches more probes. Nothing here speaks gRPC, so it is
+left out. The collector is capped at 768 MB with an internal `memory_limiter`
+that sheds telemetry below that, so observability can never starve the GPU
+workload.
 
 ## Trusting the CA
 
@@ -193,12 +392,65 @@ bounded by GPU memory.
 - **`400 Invalid Model` in Open WebUI** — the model ID sent by the UI must match
   one listed in `GET /v1/models` (the GGUF filename without the `.gguf`
   extension). Pick the model from the dropdown instead of typing it.
+- **`obi` / `collector` don't start** — `COMPOSE_FILE` in `.env` is still
+  commented out, or you ran `docker compose` from another directory (the value
+  is resolved relative to the working directory). Confirm with
+  `docker compose config --services | grep obi`.
+- **OBI produces no spans** — it discovers by listening port, so nothing is
+  matched until the target is actually up and serving. Check
+  `docker compose logs obi` for a missing-capability list (OBI logs it and keeps
+  running rather than failing; set `OBI_ENFORCE_SYS_CAPS=true` to make it exit
+  instead), and confirm traffic is really flowing through `:11437`.
+- **OBI instruments the routers but not the webui (or vice versa)** — both
+  listen on 8080, so the `exe_path` glob is what tells them apart. If the
+  upstream images move their executables, update the globs in
+  `otel/obi/config.yaml`; `docker compose exec webui ps -o comm=` shows what a
+  process actually runs.
+- **OBI exits with "you need to define at least one exporter"** — an exporter
+  endpoint resolved to empty. Either leave `OBI_OTLP_ENDPOINT` commented out in
+  `.env` or give it a real value; an empty assignment overrides the default in
+  `otel/obi/config.yaml`.
+- **Collector exits with "at least one endpoint must be specified"** — you
+  selected `forward.yaml` without setting `OTLP_FORWARD_ENDPOINT`.
+- **No `llamacpp:*` metrics in the collector** — the scrape is opt-in: set
+  `LLAMA_SCRAPE_TARGETS` *and* `LLAMA_SCRAPE_MODEL` in `.env`. If the target
+  reports `up 0`, that model is not currently loaded on that router (scrapes
+  never load one — see [above](#scraping-llamacpps-engine-metrics)) or
+  `LLAMA_ENDPOINT_METRICS` is false.
+- **`obi` containers survive a disable** — run `docker compose down` *before*
+  re-commenting `COMPOSE_FILE`, or Compose no longer knows about them.
 
 ## Security notes
 
 - TLS-only everywhere; no HTTP listeners are published.
-- Every service runs unprivileged with `no-new-privileges` and no capabilities.
+- Every service in the base stack runs unprivileged with `no-new-privileges`
+  and no capabilities.
+- **The optional `obi` service is the one exception**: eBPF needs `privileged:
+  true` and `pid: host`, which is what OBI's own documentation and examples
+  use. That combination gives the container effectively full access to the host
+  and visibility into every process on it — including memory of processes
+  outside this stack. The discovery selectors in `otel/obi/config.yaml` scope
+  *what OBI instruments*, but they do not reduce what it *could* reach. Enable
+  the overlay only if you accept that trade-off; the base stack is unaffected
+  when you don't. `collector` stays hardened like everything else.
+- `LLAMA_ENDPOINT_METRICS` is on by default and nginx proxies `location /`, so
+  `/metrics` is reachable through the front door at
+  `https://localhost:11437/metrics` (and the listener is not bound to loopback).
+  It exposes token counts and throughput, not prompts or completions, and the
+  inference API on the same port is already unauthenticated — so this widens
+  what an already-trusted caller can read rather than opening a new door. To
+  keep it internal-only anyway, deny it at the proxy and let the collector
+  scrape the routers directly:
+
+  ```nginx
+  location = /metrics { deny all; }   # in the :11437 server block
+  ```
+- Traces carry request metadata (routes, status codes, timings, and with
+  `genai` enabled, LLM call attributes). Treat the collector's output as
+  sensitive, and review `OTLP_FORWARD_ENDPOINT` before shipping it off-host.
 - The certs are self-signed and the CA is private to this host — nothing leaves
   the machine.
 - Data mounts (`var/lib/llama`, `var/lib/webui`) are plain host directories and
   contain model weights and user chat data; back them up accordingly.
+- `.env` is gitignored: it is the one file that may hold backend tokens
+  (`OTLP_FORWARD_AUTHORIZATION`).
