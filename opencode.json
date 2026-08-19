@@ -5,7 +5,8 @@
   "provider": {
     "llamacpp": {
       "options": {
-        "baseURL": "https://localhost:11437/v1"
+        "baseURL": "https://localhost:11437/v1",
+        "apiKey": "{env:LITELLM_API_KEY}"
       },
       "models": {
         "gemma-4-12B-it-Q4_K_M": {

@@ -1,0 +1,78 @@
+# LiteLLM proxy configuration for llamacpp-serve.
+#
+# This file is hand-written and committed. The model_list is NOT here: it is
+# generated from the GGUFs in var/lib/llama by litellm/gen-models.sh and pulled
+# in by the include below. Regenerate it whenever you add or remove a model:
+#
+#   ./litellm/gen-models.sh --reload
+#
+# Paths in `include` are resolved relative to this file, and both files are
+# mounted into /app/config/ in the container.
+include:
+  - models.generated.yaml
+
+litellm_settings:
+  # Machine-parseable `docker compose logs litellm` output.
+  json_logs: true
+  set_verbose: false
+
+  # OpenTelemetry span per request: model, latency, token counts, errors.
+  # Requires OTEL_ENDPOINT to point at a collector (see .env.example).
+  # If you do not run a collector, comment this line out -- otherwise LiteLLM
+  # logs an export failure for every request.
+  callbacks: ["otel"]
+
+  # llama-server rejects a few OpenAI-only sampling params. Drop them rather
+  # than failing the request, so stock OpenAI clients work unmodified.
+  drop_params: true
+
+  # A cold model has to load its weights into VRAM before it emits a token, so
+  # the first request to a model is slow. Matches nginx's proxy_read_timeout.
+  # (LiteLLM's own default is 6000s, which is far too permissive.)
+  request_timeout: 600
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+
+  # The model_list is generated from disk (see above), so the DB must not be a
+  # second source of truth for it -- otherwise UI-added models silently drift
+  # from what is actually in var/lib/llama. Virtual keys, teams, budgets and
+  # spend logs still live in the DB; only model definitions are file-owned.
+  store_model_in_db: false
+
+  # The hard backstop that stops the DGX being hammered. No matter how many
+  # virtual keys exist or what limits they carry, the proxy will never have
+  # more than this many in-flight upstream requests; the rest queue in LiteLLM
+  # instead of piling onto the GPU.
+  #
+  # Sizing: each loaded model has LLAMA_ARG_PARALLEL (2) slots per router, and
+  # there are 2 routers. 8 lets a couple of models stay busy on both routers
+  # without the GPU thrashing between many resident models at once.
+  global_max_parallel_requests: 8
+
+  # One INSERT per request would hammer the remote Postgres on a busy box.
+  proxy_batch_write_at: 60
+
+  # MUST stay false. A LiteLLM background health check sends a real completion
+  # request to *every* model in model_list. Under llama.cpp router mode that
+  # would load every GGUF into VRAM on a timer and LRU-thrash the GPU -- the
+  # exact opposite of what this proxy is for. nginx already probes each
+  # router's /health via nginx/healthcheck.sh, and LiteLLM's own cooldowns
+  # (below) take a failing router out of rotation on real traffic.
+  background_health_checks: false
+
+router_settings:
+  # Send each request to whichever router currently has the fewest calls in
+  # flight. Better than round-robin for GPU work, where request cost varies by
+  # orders of magnitude. Needs no Redis.
+  routing_strategy: least-busy
+
+  # If a router is restarting, retry on the other one rather than 502-ing.
+  num_retries: 2
+
+  # Take a router out of rotation after this many failures in a minute, then
+  # try it again after cooldown_time seconds. This is the LiteLLM-side
+  # equivalent of nginx/healthcheck.sh dropping a dead socket from the pool.
+  allowed_fails: 2
+  cooldown_time: 30

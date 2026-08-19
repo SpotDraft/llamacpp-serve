@@ -5,14 +5,16 @@ sequenceDiagram
     participant WS as webui.sock
     participant W as Open WebUI :8080
     participant N1 as nginx :11437 (TLS)
-    participant UP as llama_pool
+    participant LL as litellm :4000
     participant L as llama-server router<br/>(child model)
 
     B->>N2: https://localhost:11438 (UI + SSE)
     N2->>WS: proxy to unix socket
     WS->>W: TCP :8080
-    W->>N1: OPENAI_API_BASE_URL https://172.31.0.1:11437/v1
-    N1->>UP: proxy_pass
-    UP->>L: unix socket via socat
-    L-->>W: SSE / JSON
+    W->>N1: OPENAI_API_BASE_URL https://172.31.0.1:11437/v1<br/>Bearer LITELLM_WEBUI_KEY
+    N1->>LL: proxy via litellm.sock
+    LL->>LL: auth + limits for the WebUI's own key
+    LL->>L: least-busy router, TCP :8080
+    L-->>LL: SSE / JSON
+    LL-->>W: stream
     W-->>B: stream (buffering off)

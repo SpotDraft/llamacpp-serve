@@ -2,16 +2,22 @@ sequenceDiagram
     autonumber
     participant C as Client (curl / opencode)
     participant N as nginx :11437 (TLS)
-    participant UP as llama_pool (round-robin)
-    participant SC as socat unix socket
-    participant R as llama-server router
+    participant LL as litellm :4000
+    participant PG as Remote Postgres
+    participant R as llama-server router<br/>(least-busy of llama-1/2)
     participant M as model files<br/>(var/lib/llama)
     participant P as child llama-server<br/>(model X)
+    participant OT as OTEL collector
 
-    C->>N: POST /v1/chat/completions (TLS 1.3, local CA)
-    N->>UP: proxy_pass
-    UP->>SC: pick a healthy router socket (round-robin)
-    SC->>R: TCP :8080
+    C->>N: POST /v1/chat/completions<br/>Authorization: Bearer sk-... (TLS 1.3, local CA)
+    N->>LL: proxy_pass via litellm.sock
+    LL->>PG: validate virtual key
+    alt key invalid or over budget
+        LL-->>C: 401 / 400 (never reaches the GPU)
+    end
+    LL->>LL: enforce key RPM/TPM,<br/>max_parallel_requests,<br/>global_max_parallel_requests
+    note over LL: over the cap? queue here,<br/>not on the GPU
+    LL->>R: pick least-busy router (skip any in cooldown)
     R->>R: route by "model" field
     alt model X not loaded
         R->>M: read GGUF, spawn child
@@ -19,7 +25,8 @@ sequenceDiagram
     end
     R->>P: proxy to child
     P-->>R: SSE stream
-    R-->>SC: stream
-    SC-->>UP: stream
-    UP-->>N: stream
+    R-->>LL: stream
+    LL-->>N: stream
     N-->>C: SSE stream (proxy_buffering off)
+    LL->>PG: spend log (batched every 60s)
+    LL-->>OT: span: model, deployment id, latency, tokens

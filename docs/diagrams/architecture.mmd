@@ -1,24 +1,28 @@
 flowchart TD
-    CLI1["curl / opencode<br/>https://localhost:11437/v1"]
+    CLI1["curl / opencode / Admin UI<br/>https://localhost:11437<br/>+ virtual key"]
     CLI2["Browser<br/>https://localhost:11438"]
+    CLI3["Debug only<br/>https://localhost:11439<br/>no auth"]
 
     subgraph HOST["DGX Spark host (Ubuntu)"]
         subgraph NGX["nginx container - network_mode: host"]
-            LS11437["<b>:11437</b> HTTPS - llama.cpp API"]
+            LS11437["<b>:11437</b> HTTPS - LiteLLM API + /ui"]
             LS11438["<b>:11438</b> HTTPS - Open WebUI"]
-            UP["upstream llama_pool (round-robin)"]
+            LS11439["<b>:11439</b> HTTPS - raw pool"]
+            UP["upstream llama_pool"]
             HK["healthcheck.sh<br/>probe every 5s + reload"]
             CERTS["TLS certs<br/>nginx/certs/"]
         end
 
         subgraph NET["bridge network llama - 172.31.0.0/24"]
-            subgraph POOL["llama.cpp router pool - 2 instances, shared model store"]
-                L1["llama-1<br/>router :8080"]
-                L2["llama-2<br/>router :8080"]
-            end
+            SL["socat-litellm<br/>litellm.sock"]
+            LL["<b>litellm</b> :4000<br/>auth - rate limits - concurrency caps<br/>spend log - OTEL - least-busy routing"]
             subgraph SOC["socat bridges -> unix sockets"]
                 S1["socat-1<br/>llama-1.sock"]
                 S2["socat-2<br/>llama-2.sock"]
+            end
+            subgraph POOL["llama.cpp router pool - 2 instances, shared model store"]
+                L1["llama-1<br/>router :8080"]
+                L2["llama-2<br/>router :8080"]
             end
             W["webui<br/>:8080"]
             SW["socat-webui<br/>webui.sock"]
@@ -26,21 +30,39 @@ flowchart TD
 
         GPU["NVIDIA GB10 GPU<br/>(CDI: nvidia.com/gpu=all)"]
         MODELS["var/lib/llama<br/>GGUF model files<br/>(loaded on demand)"]
+        GEN["var/run/litellm<br/>models.generated.yaml"]
         DATA["var/lib/webui<br/>SQLite + uploads"]
+    end
+
+    subgraph EXT["External services"]
+        PG[("PostgreSQL<br/>keys - budgets<br/>counters - spend logs")]
+        OTEL["OTEL collector"]
     end
 
     CLI1 -->|TLS| LS11437
     CLI2 -->|TLS| LS11438
-    LS11437 --> UP
-    UP -.->|llama-1.sock| S1
-    UP -.->|llama-2.sock| S2
+    CLI3 -->|TLS, bypasses LiteLLM| LS11439
+
+    LS11437 -.->|litellm.sock| SL
+    SL -->|TCP :4000| LL
+    GEN -.->|include: model_list| LL
+    LL -->|least-busy| L1
+    LL -->|least-busy| L2
+    LL --> PG
+    LL -.->|spans| OTEL
+
     LS11438 -.->|webui.sock| SW
+    SW -->|TCP :8080| W
+    W -.->|https://172.31.0.1:11437<br/>+ LITELLM_WEBUI_KEY| LS11437
+    W --> DATA
+
+    LS11439 --> UP
+    UP -.-> S1
+    UP -.-> S2
     S1 -->|TCP :8080| L1
     S2 -->|TCP :8080| L2
-    SW -->|TCP :8080| W
-    W -.->|https://172.31.0.1:11437| LS11437
     HK -.->|curl --unix-socket /health| S1
     HK -.->|curl --unix-socket /health| S2
+
     L1 & L2 --> GPU
     L1 & L2 --> MODELS
-    W --> DATA
