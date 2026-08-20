@@ -195,8 +195,18 @@ on both routers.
   `https://localhost:11437/v1` with the local CA trusted by the system store.
   Set `model` (and the model key under `provider.llamacpp.models`) to one of the
   model IDs from `GET /v1/models` — the GGUF filename without the `.gguf`
-  extension. With LiteLLM enabled, add `"apiKey": "{env:LITELLM_API_KEY}"` and
-  `export LITELLM_API_KEY=sk-...` (a virtual key, not the master key).
+  extension. It ships with `"apiKey": "{env:LITELLM_API_KEY}"` already set, so
+  no edit is needed when you enable the overlay — just export the key:
+
+  ```sh
+  export LITELLM_API_KEY=sk-...        # a LiteLLM virtual key
+  export NODE_EXTRA_CA_CERTS=$PWD/nginx/certs/ca.crt
+  ```
+
+  Without LiteLLM the default stack has no auth and the key is ignored, so the
+  same config works either way. With the overlay on, an unset `LITELLM_API_KEY`
+  gets a `401` from the gateway rather than a connection error — set it to a
+  virtual key from the Admin UI (not the master key).
 
 ## Optional: LiteLLM gateway
 

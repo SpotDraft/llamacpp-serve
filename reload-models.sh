@@ -25,17 +25,26 @@ cd "$REPO_ROOT"
 
 # Collect -f/--file arguments and forward them to every compose invocation, so
 # the stack this script inspects is the stack the operator is running.
-COMPOSE_FILES=""
-while [ $# -gt 0 ]; do
+#
+# POSIX rotation rather than a string: consume each argument from the front of
+# "$@" and append the normalised pair to the back, counting down the original
+# argument count so the loop terminates. A space-delimited scalar expanded
+# unquoted would split a compose path containing whitespace and silently point
+# Compose at the wrong file; this script is /bin/sh, so a bash array is not an
+# option. After the loop "$@" holds only the normalised -f pairs.
+remaining=$#
+while [ "$remaining" -gt 0 ]; do
   case "$1" in
     -f|--file)
-      [ $# -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 1; }
-      COMPOSE_FILES="$COMPOSE_FILES -f $2"
+      [ "$remaining" -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 1; }
+      set -- "$@" "-f" "$2"
       shift 2
+      remaining=$((remaining - 2))
       ;;
     -f=*|--file=*)
-      COMPOSE_FILES="$COMPOSE_FILES -f ${1#*=}"
+      set -- "$@" "-f" "${1#*=}"
       shift
+      remaining=$((remaining - 1))
       ;;
     -h|--help)
       echo "usage: $0 [-f COMPOSE_FILE]..." >&2
@@ -48,10 +57,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# shellcheck disable=SC2086 # word splitting of COMPOSE_FILES is intended
-dc() { docker compose $COMPOSE_FILES "$@"; }
-
-SERVICES=$(dc config --services 2>/dev/null || true)
+SERVICES=$(docker compose "$@" config --services 2>/dev/null || true)
 [ -n "$SERVICES" ] || { echo "error: 'docker compose config --services' returned nothing; check your compose files and .env" >&2; exit 1; }
 
 has_service() { printf '%s\n' "$SERVICES" | grep -qx "$1"; }
@@ -83,12 +89,14 @@ done
 [ -n "$ROUTERS" ] || { echo "error: no llama-1/llama-2 service in the active stack" >&2; exit 1; }
 
 echo "Restarting routers:$ROUTERS"
+# $ROUTERS is a space-separated list of compose service names, which cannot
+# contain whitespace, so splitting it here is intended.
 # shellcheck disable=SC2086
-dc restart $ROUTERS
+docker compose "$@" restart $ROUTERS
 
 if [ "$LITELLM_ON" -eq 1 ]; then
   echo "Restarting LiteLLM..."
-  dc restart litellm
+  docker compose "$@" restart litellm
 fi
 
 echo ""

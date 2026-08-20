@@ -20,6 +20,7 @@ mkdir -p nginx/certs
 # without it breaks every webui -> API request.
 CERT_SANS="DNS:localhost, DNS:host.docker.internal, IP:127.0.0.1"
 REISSUED=0
+CA_NEW=0
 
 # Certs generated before webui moved to host.docker.internal (it used the
 # pinned bridge gateway 172.31.0.1, since removed) have no such SAN. Those
@@ -41,17 +42,32 @@ if [ ! -f nginx/certs/ca.key ] || [ ! -f nginx/certs/ca.crt ]; then
     echo "Generating CA certificate..."
     openssl req -x509 -newkey rsa:4096 -nodes -keyout nginx/certs/ca.key \
       -out nginx/certs/ca.crt -days 3650 -subj "/CN=llamacpp-serve CA" 2>/dev/null
+    CA_NEW=1
     echo "CA generated."
 else
     echo "CA already exists, keeping it (webui's baked-in copy must keep matching)."
 fi
 
-# The server cert is (re)issued when missing or stale. Signed by the existing
-# CA, so the webui image does not need rebuilding -- only nginx restarting.
-if [ ! -f nginx/certs/server.key ] || [ ! -f nginx/certs/server.crt ] || cert_is_stale; then
+# The server cert is (re)issued when missing, stale, or signed by a CA that is
+# no longer the one on disk. That last case matters: if the CA files are lost
+# or deleted but a SAN-valid server.crt survives, a skip here would leave nginx
+# serving a cert signed by the old CA while the new CA sits next to it -- so
+# neither the webui's baked-in copy nor the on-disk CA verifies it.
+cert_ca_mismatch() {
+    [ -f nginx/certs/server.crt ] && [ -f nginx/certs/ca.crt ] || return 1
+    openssl verify -CAfile nginx/certs/ca.crt nginx/certs/server.crt >/dev/null 2>&1 && return 1
+    return 0
+}
+
+if [ ! -f nginx/certs/server.key ] || [ ! -f nginx/certs/server.crt ] \
+   || cert_is_stale || [ "$CA_NEW" -eq 1 ] || cert_ca_mismatch; then
     if [ -f nginx/certs/server.crt ]; then
-        echo "Existing server.crt lacks DNS:host.docker.internal (pre-upgrade cert)."
-        echo "Reissuing it from the existing CA."
+        if cert_is_stale; then
+            echo "Existing server.crt lacks DNS:host.docker.internal (pre-upgrade cert)."
+        else
+            echo "Existing server.crt was signed by a different CA than the one on disk."
+        fi
+        echo "Reissuing it."
         REISSUED=1
     fi
     rm -f nginx/certs/server.csr
@@ -82,6 +98,23 @@ fi
 # un-migrated .env breaks `docker compose up` outright on upgrade.
 echo "Checking .env..."
 
+# Postgres applies POSTGRES_PASSWORD only when initdb runs on an empty volume.
+# So if a postgres-data volume already exists, its role password is whatever it
+# was initialised with, and minting a fresh one here would hand LiteLLM a
+# credential the database does not accept -- locking it out of its own virtual
+# keys, budgets and spend history. This can happen with no .env at all: delete
+# or lose .env while the volume survives and the "fresh install" path would
+# otherwise generate a new password.
+#
+# Best effort: if docker is unreachable we fall through to generating one,
+# which is correct for a genuinely fresh install.
+postgres_volume_exists() {
+    command -v docker >/dev/null 2>&1 || return 1
+    _proj=$(sed -n 's|^name:[[:space:]]*\([A-Za-z0-9_.-]\{1,\}\).*|\1|p' docker-compose.yml | head -1)
+    [ -n "$_proj" ] || _proj=$(basename "$(pwd)")
+    docker volume inspect "${_proj}_postgres-data" >/dev/null 2>&1
+}
+
 # Append KEY=VALUE only when KEY is absent or empty. Never overwrites a value
 # the operator has set.
 ensure_env() {
@@ -104,7 +137,17 @@ if [ ! -f .env ]; then
     MASTER_KEY="sk-$(openssl rand -hex 24)"
     SALT_KEY="$(openssl rand -hex 24)"
     UI_PW="$(openssl rand -hex 12)"
-    DB_PW="$(openssl rand -hex 24)"
+    if postgres_volume_exists; then
+        # Volume outlived .env: keep the password it was initialised with.
+        DB_PW="litellm"
+        echo "  NOTE: an existing postgres-data volume was found, so"
+        echo "        LITELLM_DB_PASSWORD is set to the historical default"
+        echo "        rather than a fresh secret (Postgres ignores"
+        echo "        POSTGRES_PASSWORD on a non-empty volume)."
+        echo "        See the README to rotate it properly."
+    else
+        DB_PW="$(openssl rand -hex 24)"
+    fi
     # The WebUI starts on the master key so the stack comes up in one shot
     # once LiteLLM is enabled; swap it for a dedicated virtual key afterwards.
     sed \
@@ -138,11 +181,15 @@ else
     # step (see README, "Rotating the bundled Postgres password").
     ensure_env LITELLM_DB_PASSWORD "litellm"
 
+    # Unconditionally, not just when something was appended: an .env created by
+    # hand (or by an older setup.sh, or restored from a backup) can be 0644 and
+    # would otherwise keep leaking the master key to every user on the box.
+    chmod 600 .env
+
     if [ "$MIGRATED" -eq 1 ]; then
-        chmod 600 .env
-        echo ".env migrated. Review the appended values before starting LiteLLM."
+        echo ".env migrated (mode 600). Review the appended values before starting LiteLLM."
     else
-        echo ".env is already complete, leaving it alone."
+        echo ".env is already complete, leaving its contents alone (mode 600 enforced)."
     fi
 fi
 
@@ -191,8 +238,14 @@ fi
 echo ""
 echo "Setup complete!"
 echo ""
-if [ "$REISSUED" -eq 1 ]; then
-    echo "NOTE: the server certificate was reissued. Recreate the TLS consumers:"
+if [ "$REISSUED" -eq 1 ] && [ "$CA_NEW" -eq 1 ]; then
+    echo "NOTE: a NEW CA was generated, so the webui image's baked-in copy is stale."
+    echo "      Rebuild it, or webui cannot verify nginx:"
+    echo "  docker compose up -d --build --force-recreate nginx webui"
+    echo ""
+elif [ "$REISSUED" -eq 1 ]; then
+    echo "NOTE: the server certificate was reissued from the existing CA."
+    echo "      No image rebuild needed; just recreate the TLS consumers:"
     echo "  docker compose up -d --force-recreate nginx webui"
     echo ""
 fi
