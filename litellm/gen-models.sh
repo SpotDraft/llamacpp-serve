@@ -66,10 +66,28 @@ is_shard() {
   esac
 }
 
+# The basename is interpolated straight into double-quoted YAML scalars below
+# and becomes the public model ID. A filename containing a quote, backslash,
+# newline or `#` would emit a broken models.generated.yaml and LiteLLM would
+# refuse to start with a parse error pointing at a generated file nobody
+# edited. Reject up front with the offending name instead of escaping: a
+# model ID is a user-facing API string, so it should be boring anyway.
+#
+# Allowed: letters, digits, dot, underscore, plus, hyphen.
+is_safe_name() {
+  case "$1" in
+    '' | *[!A-Za-z0-9._+-]*) return 1 ;;
+    # A leading hyphen would be read as a flag by anything consuming the ID.
+    -*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Collect model IDs first so we can emit an explicit empty list when there are
 # none -- a bare `model_list:` key parses as null and LiteLLM fails to start.
 : > "$NAMES"
 count=0
+bad=0
 for f in "$MODELS_DIR"/*.gguf; do
   [ -f "$f" ] || continue
   base=$(basename "$f" .gguf)
@@ -77,9 +95,22 @@ for f in "$MODELS_DIR"/*.gguf; do
     echo "skip (sharded GGUF, needs LLAMA_ARG_MODELS_PRESET): $(basename "$f")" >&2
     continue
   fi
+  if ! is_safe_name "$base"; then
+    echo "error: unsupported GGUF filename: $(basename "$f")" >&2
+    bad=$((bad + 1))
+    continue
+  fi
   printf '%s\n' "$base" >> "$NAMES"
   count=$((count + 1))
 done
+
+if [ "$bad" -gt 0 ]; then
+  echo "error: $bad GGUF filename(s) contain characters that cannot be a model ID" >&2
+  echo "error: rename them to use only letters, digits, '.', '_', '+' and '-'" >&2
+  echo "error: (the filename minus .gguf is the model ID clients send)" >&2
+  rm -f "$NAMES"
+  exit 1
+fi
 
 if [ "$count" -gt "$n_routers" ]; then
   echo "error: $count GGUFs in $MODELS_DIR; this stack runs at most $n_routers models (one per llama-server)" >&2

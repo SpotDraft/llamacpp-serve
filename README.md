@@ -16,8 +16,14 @@ appending `docker-compose.litellm.yml` to `COMPOSE_FILE` (see
 
 - **2 GPU `llama-server` instances** on the same DGX Spark, each with full
   GPU access via NVIDIA CDI (`nvidia.com/gpu=all`) and a **32768** context.
-- **At most two models** — drop up to two `.gguf` files into `var/lib/llama`.
-  Each file is served by its own `llama-server` (`LLAMA_ARG_MODELS_MAX=1`).
+- **One resident model per router** — `LLAMA_ARG_MODELS_MAX=1` caps how many
+  models each `llama-server` keeps loaded, not how many it discovers. The
+  default stack serves every standalone `.gguf` in `var/lib/llama` and
+  LRU-evicts as needed.
+- **At most two models *with LiteLLM*** — the pinning generator
+  (`litellm/gen-models.sh`) maps one GGUF to one `api_base`, so it refuses a
+  third standalone file. This bound is enforced by the generator, not by
+  `docker-compose.yml`; the default stack has no such limit.
 - **Shared model store** — both routers mount the same `var/lib/llama` host
   directory, so each GGUF lives on disk exactly once.
 - **OpenAI-compatible API** — `llama-server` exposes `/v1/chat/completions`,
@@ -25,9 +31,14 @@ appending `docker-compose.litellm.yml` to `COMPOSE_FILE` (see
   can talk to it.
 - **Two dedicated routers** — one resident GGUF each. A restart of `llama-1`
   only takes down its pinned model; `llama-2` keeps serving the other.
-- **Dynamic upstream pool** — `healthcheck.sh` probes each instance's socket
-  every 5 s and regenerates the nginx upstream, reloading only on change. Failed
-  instances are dropped from the pool automatically.
+- **Dynamic upstream pool (default stack only)** — `healthcheck.sh` probes each
+  instance's socket every 5 s and regenerates the nginx upstream, reloading only
+  on change. Failed instances are dropped from the pool automatically. With the
+  LiteLLM overlay nginx has no `llama_pool` at all — LiteLLM does the routing
+  and the watcher is not run.
+- **Request correlation** — nginx honours an inbound `X-Request-ID` (or mints
+  one), forwards it upstream, echoes it back on the response, and logs it as
+  `rid=` so a client-visible id ties the access log to the gateway log.
 - **Pinned models with LiteLLM** — each GGUF has one `api_base`. LiteLLM always
   sends that model to its home `llama-server` and never fail over onto the
   neighbour (that would put two GGUFs on one GPU). Without LiteLLM, nginx
@@ -236,19 +247,34 @@ dedicated virtual key in the Admin UI afterwards.
 ### Adding or removing a model
 
 `llama-server` scans `var/lib/llama` only at startup, and LiteLLM reads its
-generated `model_list` only at startup, so both need a recreate. At most two
-standalone `.gguf` files:
+generated `model_list` only at startup, so both need restarting:
 
 ```sh
 cp ~/new-model.gguf var/lib/llama/   # or rm var/lib/llama/old.gguf
-./reload-models.sh                   # gen-models + compose down/up
+./reload-models.sh                   # gen-models + restart routers (+ LiteLLM)
 ```
+
+If you select the overlay with explicit `-f` flags instead of `COMPOSE_FILE`,
+pass the same flags so the script acts on the same stack:
+
+```sh
+./reload-models.sh -f docker-compose.yml -f docker-compose.litellm.yml
+```
+
+`reload-models.sh` restarts rather than recreating: both the model store and
+the generated `model_list` are bind mounts whose contents are already visible
+inside the containers, so only a process restart is needed. It also asks
+`docker compose config --services` whether `litellm` is in the active stack,
+and only then treats a generator failure as fatal — the default stack does not
+read `models.generated.yaml` at all.
 
 `./litellm/gen-models.sh` prints the pin map (`model -> llama-N`). Assignment
 is sorted filename order (1st file → `llama-1`, 2nd → `llama-2`), and the
-script exits if a third standalone `.gguf` is present (before the stack is
-taken down). There is no replicate-onto-every-router mode: that would double
-VRAM for a hot model.
+script exits if a third standalone `.gguf` is present. There is no
+replicate-onto-every-router mode: that would double VRAM for a hot model.
+GGUF filenames must be usable as model IDs — letters, digits, `.`, `_`, `+`
+and `-` only — since the filename minus `.gguf` is what clients send and what
+is written into the generated YAML.
 
 ### Governing GPU access
 
@@ -399,3 +425,46 @@ With `docker-compose.litellm.yml`:
   root-owned.
 - Prompt and response *metadata* (not content) also leaves the host for your
   OTEL collector if you enable it.
+- **The routers are not reachable by anything but LiteLLM.** A flat network
+  would make the gateway optional: `llama-server` has no authentication and
+  listens on `0.0.0.0:8080`, so any peer — including `webui`, which runs
+  model-driven tool calls — could call `http://llama-1:8080/v1/...` directly
+  and bypass auth, per-key rate limits, accounting and the concurrency cap.
+  The overlay therefore splits the flat `llama` network into four segments:
+
+  | Network    | Members                                          | Egress |
+  | ---------- | ------------------------------------------------ | ------ |
+  | `frontend` | `webui`, `socat-webui`                           | yes    |
+  | `llama`    | `nginx`, `socat-litellm`, `litellm`              | yes    |
+  | `backend`  | `llama-1`, `llama-2`, `socat-1/2`, `litellm`     | no (`internal`) |
+  | `db`       | `postgres`, `litellm`                            | no (`internal`) |
+
+  `litellm` is the only service spanning segments. The webui reaches the API
+  the same way an external client does — TLS via `host.docker.internal:11437`
+  — so it needs no route to the routers or the database.
+- **Supporting images are pinned by digest** (`litellm`, `nginx`, `postgres`,
+  `alpine/socat`) so a registry retag cannot change them on restart. The
+  llama.cpp image deliberately stays on the rolling `server-cuda` tag; see the
+  comment in `docker-compose.yml` for how to pin it too.
+
+### Rotating the bundled Postgres password
+
+`LITELLM_DB_PASSWORD` in `.env` feeds both `POSTGRES_PASSWORD` and LiteLLM's
+`DATABASE_URL`. Postgres only applies `POSTGRES_PASSWORD` when `initdb` runs on
+an **empty** volume, so editing `.env` alone does not rotate anything — it just
+makes LiteLLM authenticate with the wrong password. Rotate inside the database
+as well:
+
+```sh
+NEW=$(openssl rand -hex 24)                 # keep it URL-safe: it goes into a DSN
+docker compose exec postgres psql -U litellm -d litellm \
+  -c "ALTER USER litellm WITH PASSWORD '$NEW';"
+sed -i "s|^LITELLM_DB_PASSWORD=.*|LITELLM_DB_PASSWORD=$NEW|" .env
+docker compose up -d --force-recreate litellm
+```
+
+To start over instead, `docker compose down` and remove the `postgres-data`
+volume — that discards virtual keys, teams, budgets and spend history.
+
+Stacks created before this setting existed keep working: both the compose file
+and `setup.sh`'s `.env` migration fall back to the historical `litellm`.

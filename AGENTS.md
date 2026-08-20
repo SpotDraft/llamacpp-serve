@@ -45,6 +45,14 @@ curl -sk --max-time 3 -o /dev/null -w '%{http_code}\n' https://localhost:11438/
 LiteLLM file interpolates `LITELLM_WEBUI_KEY`; run `./setup.sh` first, or it
 fails with a message naming the file.
 
+`./setup.sh` is idempotent and safe to re-run on an existing install: it
+migrates an `.env` that predates a setting (appending only what is missing),
+reissues a `server.crt` whose SANs lack `DNS:host.docker.internal`, and never
+touches an existing CA (the webui image bakes a copy in at build time). A
+failing `gen-models.sh` is a warning, not a fatal error — it runs *after* the
+chown/chmod hardening so a model store it cannot pin never leaves private keys
+world-readable.
+
 After changing behavior, start the stack (`docker compose up --build -d`) and run
 the smoke tests from the README.
 
@@ -52,8 +60,15 @@ the smoke tests from the README.
 
 - Both `llama-server` instances run in **router mode** (no `LLAMA_ARG_MODEL`):
   models are discovered from `var/lib/llama` at startup and served on demand.
-- **At most 2 standalone `.gguf` files.** `./litellm/gen-models.sh` exits if
-  there are more. Sorted filename order: 1st → `llama-1`, 2nd → `llama-2`.
+- **At most 2 standalone `.gguf` files — a LiteLLM-path limit, not a stack
+  limit.** `./litellm/gen-models.sh` exits if there are more. Sorted filename
+  order: 1st → `llama-1`, 2nd → `llama-2`. `docker-compose.yml` enforces
+  nothing: `LLAMA_ARG_MODELS_MAX=1` caps *resident* models per router, so the
+  default stack happily discovers and serves a third GGUF with LRU eviction.
+  Do not "fix" the default stack to enforce 2 — fix the docs if they drift.
+- **GGUF filenames must be valid model IDs** (`[A-Za-z0-9._+-]`, no leading
+  `-`). `gen-models.sh` rejects anything else rather than emitting a filename
+  straight into a quoted YAML scalar.
 - **Adding a model:** drop a `.gguf` into `var/lib/llama/` then
   `./reload-models.sh` (regenerates the LiteLLM pin map, then
   `docker compose down` / `up -d`). The model ID is the filename without the
@@ -90,6 +105,27 @@ with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
   `var/lib/llama`.
 - `litellm` is the one service **not** pinned to `1000:1000` — see the comment
   in `docker-compose.litellm.yml` before "fixing" it.
+- **The overlay splits the flat `llama` network into four segments**
+  (`frontend` / `llama` / `backend` / `db`; the last two are `internal`).
+  `litellm` is the only service spanning them. Do not put `webui` or `nginx`
+  back on the routers' network: `llama-server` has no auth, so a shared
+  network makes the whole gateway bypassable. The webui reaches the API over
+  TLS via `host.docker.internal:11437`, exactly like an external client.
+- **No nginx health watcher in overlay mode, by design.** `healthcheck.sh`
+  exists to prune the `llama_pool` upstream, and `nginx.litellm.conf` has no
+  such upstream — nginx only proxies `litellm.sock` and `webui.sock`. LiteLLM
+  owns routing, and each model has exactly one deployment, so there is no
+  second target to fail over to; removing a dead router would turn an upstream
+  error into a no-deployments error. `allowed_fails`/`cooldown_time` cover the
+  accounting side.
+- **Supporting images are digest-pinned** (`litellm`, `nginx`, `postgres`,
+  `alpine/socat`). llama.cpp intentionally is not. Re-resolve with
+  `docker buildx imagetools inspect <ref>` and keep the readable tag in front
+  of the `@sha256:`.
+- `LITELLM_DB_PASSWORD` gates the bundled Postgres and is interpolated into
+  `DATABASE_URL`. It falls back to `litellm` so pre-existing `postgres-data`
+  volumes keep working — Postgres only honours `POSTGRES_PASSWORD` on an empty
+  volume. Never hand an existing volume a fresh random password.
 - Version is pinned (`ghcr.io/berriai/litellm:v1.97.0`). Bump deliberately.
 - Postgres is bundled in `docker-compose.litellm.yml` (no host port).
 

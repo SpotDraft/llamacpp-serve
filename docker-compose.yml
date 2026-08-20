@@ -5,6 +5,11 @@ name: llamacpp-serve
 #   docker compose -f docker-compose.yml -f docker-compose.litellm.yml up -d
 
 x-llama-base: &llama-base
+  # Deliberately NOT digest-pinned: this is the inference engine and the point
+  # of the rolling tag is to pick up llama.cpp/CUDA fixes. The supporting
+  # images (nginx, socat, postgres, litellm) are pinned instead. Pin this too
+  # if you need byte-identical rebuilds:
+  #   docker buildx imagetools inspect ghcr.io/ggml-org/llama.cpp:server-cuda
   image: ghcr.io/ggml-org/llama.cpp:server-cuda
   restart: unless-stopped
   # Run as the host user so files created are not root-owned.
@@ -25,10 +30,19 @@ x-llama-base: &llama-base
             capabilities:
               - gpu
   # llama-server config via its LLAMA_ARG_* env vars.
-  # Router mode (no LLAMA_ARG_MODEL): the two .gguf files in var/lib/llama/
-  # (mounted /models) are discovered at startup. Each router holds one
-  # resident model (LLAMA_ARG_MODELS_MAX=1). LiteLLM pins each GGUF to
-  # exactly one router so the two servers never load the same weights.
+  # Router mode (no LLAMA_ARG_MODEL): every standalone .gguf in var/lib/llama/
+  # (mounted /models) is discovered at startup and advertised on /v1/models.
+  #
+  # LLAMA_ARG_MODELS_MAX=1 bounds how many models are *resident* per router,
+  # not how many are discovered: drop in a third GGUF and both routers will
+  # still serve all three, LRU-evicting to keep one loaded each. That is a
+  # supported default-stack configuration, it just trades VRAM churn for
+  # breadth.
+  #
+  # The "one GGUF per router" limit belongs to the LiteLLM overlay, which
+  # pins each model to exactly one api_base (litellm/gen-models.sh) so the
+  # two servers never load the same weights. That generator is the thing
+  # that caps the count at 2 -- this file does not.
   environment:
     LLAMA_ARG_HOST: 0.0.0.0
     LLAMA_ARG_PORT: "8080"
@@ -54,7 +68,11 @@ x-llama-base: &llama-base
       max-file: "100"
 
 x-socat-base: &socat-base
-  image: alpine/socat:latest
+  # Pinned by multi-arch index digest: this bridge sits between nginx and every
+  # backend, so a registry retag must not be able to swap it out on restart.
+  # Bump deliberately with:
+  #   docker buildx imagetools inspect alpine/socat:latest
+  image: alpine/socat:latest@sha256:3ed1cd38741bd445ebffa3aecb9d80c46a83db45f5b5ef03332976c7ca9814af
   restart: unless-stopped
   user: "1000:1000"
   # Harden: no new privileges, drop all capabilities.
@@ -138,7 +156,7 @@ services:
         max-file: "100"
 
   socat-webui:
-    image: alpine/socat:latest
+    image: alpine/socat:latest@sha256:3ed1cd38741bd445ebffa3aecb9d80c46a83db45f5b5ef03332976c7ca9814af
     restart: unless-stopped
     user: "1000:1000"
     # Harden: no new privileges, drop all capabilities.
@@ -160,7 +178,9 @@ services:
         max-file: "100"
 
   nginx:
-    image: nginx:latest
+    # Pinned by multi-arch index digest; bump deliberately with:
+    #   docker buildx imagetools inspect nginx:latest
+    image: nginx:latest@sha256:8f029c543423e3eac6b08254718bc31eb75633b1e448026b6616927baa7d4bfe
     restart: unless-stopped
     # Run as non-root.
     user: "1000:1000"
