@@ -49,9 +49,11 @@ fails with a message naming the file.
 migrates an `.env` that predates a setting (appending only what is missing),
 reissues a `server.crt` whose SANs lack `DNS:host.docker.internal` or whose
 key does not match, and never touches an existing CA (the webui image bakes a
-copy in at build time). A failing `gen-models.sh` is a warning, not a fatal
-error — it runs *after* the chown/chmod hardening so a model store it cannot
-pin never leaves private keys world-readable.
+copy in at build time). A failing `gen-models.sh` is a warning unless
+`COMPOSE_FILE` already selects the LiteLLM overlay — it runs *after* the
+chown/chmod hardening so a model store it cannot pin never leaves private keys
+world-readable, and it deletes `models.generated.yaml` so the overlay cannot
+start on a stale pin map.
 
 After changing behavior, start the stack (`docker compose up --build -d`) and run
 the smoke tests from the README.

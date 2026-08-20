@@ -230,20 +230,70 @@ echo "Restricting private key permissions..."
 chmod 600 nginx/certs/*.key
 echo "Permissions restricted successfully."
 
+# The overlay interpolates LITELLM_DB_PASSWORD into DATABASE_URL. URI-reserved
+# characters would be parsed as DSN syntax, so LiteLLM would authenticate with
+# a different string than POSTGRES_PASSWORD. setup.sh only ever writes hex (or
+# the historical `litellm`); this catches a hand-edited value before compose
+# starts. Fatal only when the overlay is the configured stack -- same rule as
+# gen-models.sh -- so a default-stack install is not blocked by a secret it
+# does not interpolate.
+overlay_requested() {
+    _cf="${COMPOSE_FILE:-}"
+    if [ -z "$_cf" ] && [ -f .env ]; then
+        _cf=$(sed -n 's/^COMPOSE_FILE=//p' .env | head -1)
+    fi
+    case "$_cf" in
+        *docker-compose.litellm.yml*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+db_password_url_safe() {
+    [ -f .env ] || return 0
+    _pw=$(sed -n 's|^LITELLM_DB_PASSWORD=\(.\{1,\}\)$|\1|p' .env | head -1)
+    [ -n "$_pw" ] || return 0
+    case "$_pw" in
+        *[!A-Za-z0-9._~-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+if ! db_password_url_safe; then
+    echo ""
+    echo "LITELLM_DB_PASSWORD contains URI-reserved characters and cannot be"
+    echo "interpolated into DATABASE_URL (see .env.example). Generate a"
+    echo "URL-safe secret with \`openssl rand -hex 24\` and rotate as in the"
+    echo "README."
+    if overlay_requested; then
+        echo "error: COMPOSE_FILE includes the LiteLLM overlay; refusing to finish."
+        exit 1
+    fi
+    echo "WARNING: the default stack is unaffected; rotate before enabling LiteLLM."
+fi
+
 # Generate the LiteLLM model list from whatever GGUFs are present. Harmless
-# with an empty model store; required before enabling LiteLLM. Non-fatal: the
-# default stack does not read this file, so a store the generator cannot pin
-# (more standalone GGUFs than routers, or an unsupported filename) must not
-# stop the default stack from being set up.
+# with an empty model store; required before enabling LiteLLM. Non-fatal for
+# the default stack: it does not read this file, so a store the generator
+# cannot pin must not stop that stack from being set up. A failed run deletes
+# models.generated.yaml (see gen-models.sh), so the overlay cannot start on a
+# stale pin map. Fatal when COMPOSE_FILE already selects the overlay.
 echo "Generating LiteLLM model list..."
 GEN_OK=1
 ./litellm/gen-models.sh || GEN_OK=0
 if [ "$GEN_OK" -eq 0 ]; then
     echo ""
     echo "WARNING: could not generate the LiteLLM model list (see the errors above)."
+    echo "         The generated pin map was removed so the overlay cannot start"
+    echo "         on a stale models.generated.yaml."
     echo "         The default stack is unaffected and is ready to start."
     echo "         Fix the model store and re-run ./litellm/gen-models.sh before"
     echo "         enabling docker-compose.litellm.yml."
+    if overlay_requested; then
+        echo ""
+        echo "error: COMPOSE_FILE includes the LiteLLM overlay, so setup cannot"
+        echo "       finish with no pin map."
+        exit 1
+    fi
 fi
 
 # Re-apply ownership to the file the generator just wrote (if it ran).

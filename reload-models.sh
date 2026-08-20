@@ -76,8 +76,9 @@ else
   # to refuse the reload.
   if ! ./litellm/gen-models.sh; then
     echo ""
-    echo "WARNING: model list not regenerated (see above). LiteLLM is not in the"
-    echo "         active stack, so this does not affect the reload."
+    echo "WARNING: model list not regenerated (see above). The previous pin map"
+    echo "         was removed. LiteLLM is not in the active stack, so this"
+    echo "         does not affect the reload."
   fi
 fi
 

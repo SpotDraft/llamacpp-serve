@@ -26,6 +26,24 @@ REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 MODELS_DIR="${MODELS_DIR:-$REPO_ROOT/var/lib/llama}"
 OUT="${OUT:-$REPO_ROOT/var/run/litellm/models.generated.yaml}"
 
+# A failed pin must not leave the previous map in place. setup.sh treats
+# generator failure as non-fatal for the default stack, and the overlay
+# bind-mounts this file with create_host_path: false -- deleting it makes
+# `docker compose up` fail loudly instead of advertising removed models or
+# routing to a stale api_base. Only the "this store cannot be pinned" exits
+# discard it; a missing MODELS_DIR or a usage error must not.
+die() {
+  rm -f "${TMP:-}" "${NAMES:-}"
+  exit 1
+}
+
+discard_pin_map() {
+  if [ -f "$OUT" ]; then
+    echo "error: removing stale pin map: $OUT" >&2
+    rm -f "$OUT"
+  fi
+}
+
 # Must match the service names in docker-compose.yml and their container port.
 ROUTERS="${ROUTERS:-llama-1 llama-2}"
 ROUTER_PORT="${ROUTER_PORT:-8080}"
@@ -43,7 +61,7 @@ case "${1:-}" in
   *) echo "usage: $0 [--reload]" >&2; exit 1 ;;
 esac
 
-[ -d "$MODELS_DIR" ] || { echo "error: model store not found: $MODELS_DIR (run ./setup.sh)" >&2; exit 1; }
+[ -d "$MODELS_DIR" ] || { echo "error: model store not found: $MODELS_DIR (run ./setup.sh)" >&2; die; }
 
 mkdir -p "$(dirname "$OUT")"
 TMP="$OUT.tmp"
@@ -53,7 +71,7 @@ n_routers=0
 for _r in $ROUTERS; do
   n_routers=$((n_routers + 1))
 done
-[ "$n_routers" -gt 0 ] || { echo "error: ROUTERS is empty" >&2; exit 1; }
+[ "$n_routers" -gt 0 ] || { echo "error: ROUTERS is empty" >&2; die; }
 
 # Sharded GGUFs (foo-00001-of-00003.gguf) are not standalone models: neither
 # llama-server's --models-dir scan nor this script can serve them directly, so
@@ -108,15 +126,15 @@ if [ "$bad" -gt 0 ]; then
   echo "error: $bad GGUF filename(s) contain characters that cannot be a model ID" >&2
   echo "error: rename them to use only letters, digits, '.', '_', '+' and '-'" >&2
   echo "error: (the filename minus .gguf is the model ID clients send)" >&2
-  rm -f "$NAMES"
-  exit 1
+  discard_pin_map
+  die
 fi
 
 if [ "$count" -gt "$n_routers" ]; then
   echo "error: $count GGUFs in $MODELS_DIR; this stack runs at most $n_routers models (one per llama-server)" >&2
   echo "error: keep 1 or 2 standalone .gguf files (plus optional shards, which are skipped)" >&2
-  rm -f "$NAMES"
-  exit 1
+  discard_pin_map
+  die
 fi
 
 # Sorted unique pin: line N of the sorted names -> Nth router.

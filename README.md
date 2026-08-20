@@ -276,7 +276,10 @@ the generated `model_list` are bind mounts whose contents are already visible
 inside the containers, so only a process restart is needed. It also asks
 `docker compose config --services` whether `litellm` is in the active stack,
 and only then treats a generator failure as fatal — the default stack does not
-read `models.generated.yaml` at all.
+read `models.generated.yaml` at all. `./setup.sh` uses the same rule against
+`COMPOSE_FILE`. A failed generation also deletes the pin map, so the overlay
+cannot start on stale `api_base` entries (`create_host_path: false` makes the
+missing file a bind-mount error instead of a silent boot).
 
 `./litellm/gen-models.sh` prints the pin map (`model -> llama-N`). Assignment
 is sorted filename order (1st file → `llama-1`, 2nd → `llama-2`), and the
