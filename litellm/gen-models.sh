@@ -17,14 +17,20 @@ set -eu
 #
 # Usage:
 #   ./litellm/gen-models.sh            # regenerate the model list
-#   ./reload-models.sh                 # regenerate, then compose down/up
+#   ./reload-models.sh                 # regenerate, then restart routers (+ LiteLLM)
 #   ./litellm/gen-models.sh --reload   # regenerate, then restart routers
 #                                      # (and LiteLLM if that compose file is on)
 
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 MODELS_DIR="${MODELS_DIR:-$REPO_ROOT/var/lib/llama}"
-OUT="${OUT:-$REPO_ROOT/var/run/litellm/models.generated.yaml}"
+# Compose bind-mounts this exact path (create_host_path: false). OUT is an
+# escape hatch for previewing a pin map somewhere else; it is not wired into
+# the overlay, so a custom value is warned about and discard_pin_map still
+# only touches $OUT (never the live mount — that would trash a real pin map
+# during an isolated run).
+COMPOSE_OUT="$REPO_ROOT/var/run/litellm/models.generated.yaml"
+OUT="${OUT:-$COMPOSE_OUT}"
 
 # A failed pin must not leave the previous map in place. setup.sh treats
 # generator failure as non-fatal for the default stack, and the overlay
@@ -60,6 +66,11 @@ case "${1:-}" in
   '') ;;
   *) echo "usage: $0 [--reload]" >&2; exit 1 ;;
 esac
+
+if [ "$OUT" != "$COMPOSE_OUT" ]; then
+  echo "warning: OUT=$OUT is not the LiteLLM mount ($COMPOSE_OUT);" >&2
+  echo "warning: the overlay will keep reading the compose path, not this file" >&2
+fi
 
 [ -d "$MODELS_DIR" ] || { echo "error: model store not found: $MODELS_DIR (run ./setup.sh)" >&2; die; }
 

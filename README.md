@@ -100,7 +100,7 @@ the upstream keeps a placeholder `none.sock` so nginx stays valid.
 ## Repository layout
 
 ```
-├── reload-models.sh             # After add/remove GGUFs: gen-models + compose down/up
+├── reload-models.sh             # After add/remove GGUFs: gen-models + restart
 ├── docker-compose.yml           # Default stack (llama.cpp + webui + nginx)
 ├── docker-compose.litellm.yml   # Overlay: LiteLLM on :11437 + bundled Postgres
 ├── .env.example                 # Template for .env (LiteLLM secrets, gitignored)
@@ -122,7 +122,7 @@ the upstream keeps a placeholder `none.sock` so nginx stays valid.
 │   ├── run/nginx                # generated upstream.conf
 │   └── run/litellm              # generated models.generated.yaml
 ├── docs/diagrams/               # Mermaid sources + rendered SVG/PNG diagrams
-└── opencode.json                # Example: point opencode at the local pool
+└── opencode.json                # Example OpenCode client; set model to a GGUF id
 ```
 
 ## Prerequisites
@@ -193,9 +193,12 @@ on both routers.
   (`update-ca-certificates` + `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`).
 - **opencode**: see `opencode.json`, which points `baseURL` at
   `https://localhost:11437/v1` with the local CA trusted by the system store.
-  Set `model` (and the model key under `provider.llamacpp.models`) to one of the
-  model IDs from `GET /v1/models` — the GGUF filename without the `.gguf`
-  extension. It ships with `"apiKey": "{env:LITELLM_API_KEY}"` already set, so
+  It is an example, not a catalog: the committed `model` / `small_model` ID
+  (`gemma-4-12B-it-Q4_K_M`) is one GGUF name. Set both (and the key under
+  `provider.llamacpp.models`) to an ID from `GET /v1/models` — the filename
+  without `.gguf` — or OpenCode will 400 against a store that does not contain
+  that file. There is no alias; LiteLLM only serves what `gen-models.sh` pinned.
+  It ships with `"apiKey": "{env:LITELLM_API_KEY}"` already set, so
   no edit is needed when you enable the overlay — just export the key:
 
   ```sh

@@ -72,9 +72,10 @@ the smoke tests from the README.
   `-`). `gen-models.sh` rejects anything else rather than emitting a filename
   straight into a quoted YAML scalar.
 - **Adding a model:** drop a `.gguf` into `var/lib/llama/` then
-  `./reload-models.sh` (regenerates the LiteLLM pin map, then
-  `docker compose down` / `up -d`). The model ID is the filename without the
-  `.gguf` extension. Discovery happens at startup only.
+  `./reload-models.sh` (regenerates the LiteLLM pin map, then restarts the
+  routers and LiteLLM in place — not `down`/`up`, which can reap overlay
+  services as orphans). The model ID is the filename without the `.gguf`
+  extension. Discovery happens at startup only.
 - Each router holds one resident GGUF (`LLAMA_ARG_MODELS_MAX=1`). LiteLLM
   emits **one `api_base` per model**, so a request never load-balances onto
   the neighbour. LiteLLM does **not** fail a pinned model over onto the
