@@ -48,22 +48,38 @@ else
     echo "CA already exists, keeping it (webui's baked-in copy must keep matching)."
 fi
 
-# The server cert is (re)issued when missing, stale, or signed by a CA that is
-# no longer the one on disk. That last case matters: if the CA files are lost
-# or deleted but a SAN-valid server.crt survives, a skip here would leave nginx
-# serving a cert signed by the old CA while the new CA sits next to it -- so
-# neither the webui's baked-in copy nor the on-disk CA verifies it.
+# The server cert is (re)issued when missing, stale, signed by a CA that is
+# no longer the one on disk, or paired with a key that does not match. The
+# CA case matters: if the CA files are lost or deleted but a SAN-valid
+# server.crt survives, a skip here would leave nginx serving a cert signed
+# by the old CA while the new CA sits next to it -- so neither the webui's
+# baked-in copy nor the on-disk CA verifies it.
 cert_ca_mismatch() {
     [ -f nginx/certs/server.crt ] && [ -f nginx/certs/ca.crt ] || return 1
     openssl verify -CAfile nginx/certs/ca.crt nginx/certs/server.crt >/dev/null 2>&1 && return 1
     return 0
 }
 
+# Existence is not enough: a leftover, replaced, or corrupted server.key next
+# to a still-valid cert would skip generation and leave nginx with a pair it
+# cannot load. Missing key with a surviving cert is the same failure.
+cert_key_mismatch() {
+    [ -f nginx/certs/server.crt ] || return 1
+    [ -f nginx/certs/server.key ] || return 0
+    _cert_pub=$(openssl x509 -in nginx/certs/server.crt -noout -pubkey 2>/dev/null) || return 0
+    _key_pub=$(openssl pkey -in nginx/certs/server.key -pubout 2>/dev/null) || return 0
+    [ -n "$_cert_pub" ] && [ -n "$_key_pub" ] && [ "$_cert_pub" = "$_key_pub" ] && return 1
+    return 0
+}
+
 if [ ! -f nginx/certs/server.key ] || [ ! -f nginx/certs/server.crt ] \
-   || cert_is_stale || [ "$CA_NEW" -eq 1 ] || cert_ca_mismatch; then
+   || cert_is_stale || [ "$CA_NEW" -eq 1 ] || cert_ca_mismatch \
+   || cert_key_mismatch; then
     if [ -f nginx/certs/server.crt ]; then
         if cert_is_stale; then
             echo "Existing server.crt lacks DNS:host.docker.internal (pre-upgrade cert)."
+        elif cert_key_mismatch; then
+            echo "Existing server.key is invalid or does not match server.crt."
         else
             echo "Existing server.crt was signed by a different CA than the one on disk."
         fi
