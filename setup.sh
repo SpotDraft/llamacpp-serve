@@ -189,6 +189,7 @@ else
     ensure_env UI_USERNAME        "admin"
     ensure_env UI_PASSWORD        "$(openssl rand -hex 12)"
     ensure_env LITELLM_WEBUI_KEY  "$EXISTING_MASTER"
+    ensure_env STORE_MODEL_IN_DB  "True"
 
     # Deliberately the historical default, NOT a fresh random value: Postgres
     # only applies POSTGRES_PASSWORD when initdb runs on an empty volume, so

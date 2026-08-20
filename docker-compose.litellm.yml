@@ -72,9 +72,10 @@ services:
     environment:
       # Do not auto-load a .env from the image's workdir.
       LITELLM_MODE: PRODUCTION
-      # The model_list is generated from disk; the DB must not be a second
-      # source of truth for it (see litellm/config.yaml).
-      STORE_MODEL_IN_DB: "False"
+      # Admin UI (Models page, add/edit) requires this. The GGUF pin map is
+      # still generated from disk; do not add a second api_base for a model
+      # gen-models.sh already pinned. Override with STORE_MODEL_IN_DB=False.
+      STORE_MODEL_IN_DB: ${STORE_MODEL_IN_DB:-True}
       DATABASE_URL: postgresql://litellm:${LITELLM_DB_PASSWORD:-litellm}@postgres:5432/litellm
     volumes:
       - ./litellm/config.yaml:/app/config/config.yaml:ro

@@ -103,9 +103,9 @@ with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
 - **Keep `MAX_PARALLEL` in `gen-models.sh` equal to `LLAMA_ARG_PARALLEL`.**
 - **One `api_base` per GGUF.** Do not add a second deployment for the same
   `model_name` — that would load the same weights on both servers.
-- `store_model_in_db: false` is deliberate — with the model list generated from
-  disk, letting the DB also define models creates silent drift from
-  `var/lib/llama`.
+- `STORE_MODEL_IN_DB=True` is the default so the Admin UI can add/edit models.
+  The GGUF pin map is still generated from disk; do not add a second `api_base`
+  in the UI for a model `gen-models.sh` already pinned.
 - `litellm` is the one service **not** pinned to `1000:1000` — see the comment
   in `docker-compose.litellm.yml` before "fixing" it.
 - **The overlay splits the flat `llama` network into four segments**

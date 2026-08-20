@@ -349,7 +349,7 @@ and is not wired up here; the OTEL exporter covers the same ground for free.
 | `num_retries: 1`                    | `litellm/config.yaml`   | Retry the pinned router; no cross-server failover   |
 | `request_timeout: 600`              | `litellm/config.yaml`   | Per-request timeout (matches nginx)                 |
 | `callbacks` (off by default)        | `litellm/config.yaml`   | Uncomment `["otel"]` when a collector is running    |
-| `store_model_in_db: false`          | `litellm/config.yaml`   | Keeps `model_list` file-owned, not DB-owned         |
+| `store_model_in_db: true`           | `litellm/config.yaml`   | Persists models in Postgres so the Admin UI can add/edit them |
 | `background_health_checks: false`   | `litellm/config.yaml`   | **Leave off** — it would load every GGUF on a timer |
 | `MAX_PARALLEL` (default 2)          | `litellm/gen-models.sh` | Per-deployment concurrency; match `LLAMA_ARG_PARALLEL` |
 | `ROUTERS` (default `llama-1 llama-2`) | `litellm/gen-models.sh` | The two servers models are pinned across          |

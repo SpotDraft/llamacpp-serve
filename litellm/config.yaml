@@ -36,11 +36,11 @@ general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
 
-  # The model_list is generated from disk (see above), so the DB must not be a
-  # second source of truth for it -- otherwise UI-added models silently drift
-  # from what is actually in var/lib/llama. Virtual keys, teams, budgets and
-  # spend logs still live in the DB; only model definitions are file-owned.
-  store_model_in_db: false
+  # Persist models in Postgres so the Admin UI can add/edit them. The GGUF
+  # pin map is still generated from disk; do not add a second api_base for a
+  # model that gen-models.sh already pinned (that would load the same weights
+  # on both servers).
+  store_model_in_db: true
 
   # The hard backstop that stops the DGX being hammered. No matter how many
   # virtual keys exist or what limits they carry, the proxy will never have
