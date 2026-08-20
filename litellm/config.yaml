@@ -20,7 +20,8 @@ litellm_settings:
   # Requires OTEL_ENDPOINT to point at a collector (see .env.example).
   # If you do not run a collector, comment this line out -- otherwise LiteLLM
   # logs an export failure for every request.
-  callbacks: ["otel"]
+  # No collector in the default stack. Uncomment when OTEL_ENDPOINT is live.
+  # callbacks: ["otel"]
 
   # llama-server rejects a few OpenAI-only sampling params. Drop them rather
   # than failing the request, so stock OpenAI clients work unmodified.
@@ -46,12 +47,12 @@ general_settings:
   # more than this many in-flight upstream requests; the rest queue in LiteLLM
   # instead of piling onto the GPU.
   #
-  # Sizing: each loaded model has LLAMA_ARG_PARALLEL (2) slots per router, and
-  # there are 2 routers. 8 lets a couple of models stay busy on both routers
-  # without the GPU thrashing between many resident models at once.
-  global_max_parallel_requests: 8
+  # Sizing: 2 routers x 1 resident model x LLAMA_ARG_PARALLEL slots = 4.
+  # Do not size this as if the same model were hot on both servers.
+  global_max_parallel_requests: 4
 
-  # One INSERT per request would hammer the remote Postgres on a busy box.
+  # One INSERT per request would hammer Postgres on a busy box.
+  # docker-compose.litellm.yml sets DATABASE_URL to the bundled instance.
   proxy_batch_write_at: 60
 
   # MUST stay false. A LiteLLM background health check sends a real completion
@@ -63,16 +64,19 @@ general_settings:
   background_health_checks: false
 
 router_settings:
-  # Send each request to whichever router currently has the fewest calls in
-  # flight. Better than round-robin for GPU work, where request cost varies by
-  # orders of magnitude. Needs no Redis.
+  # gen-models.sh emits exactly one api_base per model (llama-1 or llama-2),
+  # so this never load-balances a GGUF onto both servers. least-busy is a
+  # no-op with a single deployment; do not add a second api_base for the
+  # same model_name.
   routing_strategy: least-busy
 
-  # If a router is restarting, retry on the other one rather than 502-ing.
-  num_retries: 2
+  # Do not fail a pinned model over onto the other router: that would load a
+  # second GGUF on a server that already has one.
+  # A single retry covers a transient blip on the home router only.
+  num_retries: 1
 
-  # Take a router out of rotation after this many failures in a minute, then
-  # try it again after cooldown_time seconds. This is the LiteLLM-side
-  # equivalent of nginx/healthcheck.sh dropping a dead socket from the pool.
+  # Take the pinned router out of rotation after this many failures in a
+  # minute, then try it again after cooldown_time seconds. There is no
+  # other deployment to send the request to.
   allowed_fails: 2
   cooldown_time: 30

@@ -1,0 +1,46 @@
+flowchart TD
+    CLI1["curl / opencode / Admin UI<br/>https://localhost:11437<br/>plus virtual key"]
+    CLI2["Browser<br/>https://localhost:11438"]
+
+    subgraph HOST["DGX Spark host (Ubuntu)"]
+        subgraph NGX["nginx container - publishes :11437 / :11438"]
+            LS11437["<b>:11437</b> HTTPS - LiteLLM API + /ui"]
+            LS11438["<b>:11438</b> HTTPS - Open WebUI"]
+            CERTS["TLS certs<br/>nginx/certs/"]
+        end
+
+        subgraph NET["bridge network llama"]
+            SL["socat-litellm<br/>litellm.sock"]
+            LL["<b>litellm</b> :4000<br/>auth - rate limits - pinning"]
+            subgraph POOL["llama.cpp - 2 GGUFs max, not published"]
+                L1["llama-1<br/>pinned model A"]
+                L2["llama-2<br/>pinned model B"]
+            end
+            W["webui<br/>:8080"]
+            SW["socat-webui<br/>webui.sock"]
+        end
+
+        GPU["NVIDIA GB10 GPU"]
+        MODELS["var/lib/llama"]
+        GEN["models.generated.yaml"]
+        DATA["var/lib/webui"]
+        PG[("bundled Postgres")]
+    end
+
+    CLI1 -->|TLS| LS11437
+    CLI2 -->|TLS| LS11438
+
+    LS11437 -.->|litellm.sock| SL
+    SL -->|TCP :4000| LL
+    GEN -.->|include: model_list| LL
+    LL -->|"pinned GGUF A"| L1
+    LL -->|"pinned GGUF B"| L2
+    LL --> PG
+
+    LS11438 -.->|webui.sock| SW
+    SW -->|TCP :8080| W
+    W -.->|https://host.docker.internal:11437<br/>plus LITELLM_WEBUI_KEY| LS11437
+    W --> DATA
+
+    L1 & L2 --> GPU
+    L1 & L2 --> MODELS

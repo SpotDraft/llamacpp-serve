@@ -33,22 +33,23 @@ if [ ! -f nginx/certs/ca.key ] || [ ! -f nginx/certs/ca.crt ] || \
       -CAcreateserial -out nginx/certs/server.crt -days 3650 \
       -extensions v3_req -extfile /dev/stdin <<EOF
 [ v3_req ]
-subjectAltName = DNS:localhost, IP:127.0.0.1, IP:172.31.0.1
+subjectAltName = DNS:localhost, DNS:host.docker.internal, IP:127.0.0.1, IP:172.31.0.1
 EOF
     echo "Certificates generated successfully."
 else
     echo "Certificates already exist, skipping generation."
 fi
 
-# Create .env with generated secrets if it does not exist yet
+# Create .env with generated secrets if it does not exist yet. The default
+# stack does not need it; it is ready for docker-compose.litellm.yml.
 echo "Checking .env..."
 if [ ! -f .env ]; then
     echo "Creating .env from .env.example with generated secrets..."
     MASTER_KEY="sk-$(openssl rand -hex 24)"
     SALT_KEY="$(openssl rand -hex 24)"
     UI_PW="$(openssl rand -hex 12)"
-    # The WebUI starts on the master key so the stack comes up in one shot;
-    # swap it for a dedicated virtual key from the Admin UI afterwards.
+    # The WebUI starts on the master key so the stack comes up in one shot
+    # once LiteLLM is enabled; swap it for a dedicated virtual key afterwards.
     sed \
       -e "s|^LITELLM_MASTER_KEY=.*|LITELLM_MASTER_KEY=$MASTER_KEY|" \
       -e "s|^LITELLM_SALT_KEY=.*|LITELLM_SALT_KEY=$SALT_KEY|" \
@@ -56,24 +57,27 @@ if [ ! -f .env ]; then
       -e "s|^LITELLM_WEBUI_KEY=.*|LITELLM_WEBUI_KEY=$MASTER_KEY|" \
       .env.example > .env
     chmod 600 .env
-    echo ".env created. You MUST still set DATABASE_URL to your remote Postgres."
+    echo ".env created. LiteLLM is optional (append :docker-compose.litellm.yml to COMPOSE_FILE)."
 else
     echo ".env already exists, leaving it alone."
 fi
 
-# Generate the LiteLLM model list from whatever GGUFs are present. Safe to run
-# with an empty model store; re-run it after adding models.
+# Generate the LiteLLM model list from whatever GGUFs are present. Harmless
+# with an empty model store; required before enabling LiteLLM. Fails if more
+# than two standalone GGUFs are in var/lib/llama (one per llama-server).
 echo "Generating LiteLLM model list..."
 ./litellm/gen-models.sh
 
-# Set proper ownership (1000:1000)
+# Set proper ownership (1000:1000). Needs root on the DGX.
 echo "Setting proper ownership..."
-chown -R 1000:1000 var/
-chown -R 1000:1000 nginx/certs
-# This script needs root for the chowns above, so .env would otherwise be left
-# root-owned and mode 600 -- unreadable by the user running docker compose.
-chown 1000:1000 .env
-echo "Ownership set successfully."
+if [ "$(id -u)" -eq 0 ]; then
+    chown -R 1000:1000 var/
+    chown -R 1000:1000 nginx/certs
+    chown 1000:1000 .env
+    echo "Ownership set successfully."
+else
+    echo "Not root; skipping chown 1000:1000. Run as root on the DGX so uid 1000 owns var/."
+fi
 
 # Restrict private key permissions (owner read/write only)
 echo "Restricting private key permissions..."
@@ -84,13 +88,12 @@ echo ""
 echo "Setup complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Set DATABASE_URL in .env to your remote Postgres (LiteLLM needs DDL"
-echo "     rights; it migrates its schema on startup)."
-echo "  2. Review the OTEL_ENDPOINT in .env. If you do not run a collector,"
-echo "     comment out the 'otel' callback in litellm/config.yaml."
-echo "  3. Drop .gguf files into var/lib/llama/ and re-run ./litellm/gen-models.sh"
-echo "  4. docker compose up --build -d"
+echo "  1. Drop at most 2 .gguf files into var/lib/llama/"
+echo "  2. docker compose up --build -d"
 echo ""
-echo "Then open the LiteLLM Admin UI at https://localhost:11437/ui"
-echo "(user: \$UI_USERNAME, password: \$UI_PASSWORD from .env) to create"
-echo "per-client virtual keys with their own rate limits and budgets."
+echo "Optional — LiteLLM gateway (auth, rate limits, one model per server):"
+echo "  1. ./litellm/gen-models.sh"
+echo "  2. COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml in .env"
+echo "  3. docker compose up -d"
+echo "  4. Open https://localhost:11437/ui with UI_USERNAME / UI_PASSWORD"
+echo ""
