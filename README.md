@@ -249,6 +249,15 @@ hitting the GPU), sends the request to that model's **pinned** router
 (one `api_base` per GGUF), streams the response, then writes a spend log and an
 OpenTelemetry span.
 
+Stock OpenAI clients can connect unmodified (`/v1/chat/completions`,
+`/v1/models`). That is not full Responses compatibility. Each generated
+deployment sets `use_chat_completions_api: true` and
+`additional_drop_params: ["previous_response_id"]`: LiteLLM bridges
+`/v1/responses` to llama.cpp's `/chat/completions`, and
+`previous_response_id` is discarded, so Responses-style conversation
+continuation is unavailable. Send the full message history on each chat turn
+instead of chaining `previous_response_id`.
+
 A pinned router that dies takes its models with it — LiteLLM does not fail
 them over onto a neighbour, because that neighbour is already running a
 different GGUF (`LLAMA_ARG_MODELS_MAX=1`).
@@ -352,6 +361,8 @@ and is not wired up here; the OTEL exporter covers the same ground for free.
 | `store_model_in_db: true`           | `litellm/config.yaml`   | Persists models in Postgres so the Admin UI can add/edit them |
 | `background_health_checks: false`   | `litellm/config.yaml`   | **Leave off** — it would load every GGUF on a timer |
 | `MAX_PARALLEL` (default 2)          | `litellm/gen-models.sh` | Per-deployment concurrency; match `LLAMA_ARG_PARALLEL` |
+| `use_chat_completions_api: true`    | generated per model     | Bridges `/v1/responses` to llama.cpp `/chat/completions` |
+| `additional_drop_params`            | generated per model     | Drops `previous_response_id` (llama.cpp rejects it) |
 | `ROUTERS` (default `llama-1 llama-2`) | `litellm/gen-models.sh` | The two servers models are pinned across          |
 | `LITELLM_MASTER_KEY` / `LITELLM_SALT_KEY` | `.env`            | Admin credential / credential encryption key  |
 | `UI_USERNAME` / `UI_PASSWORD`       | `.env`                  | Admin UI login                                |
@@ -411,6 +422,10 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - **`bind source path does not exist: .../models.generated.yaml`** — run
   `./litellm/gen-models.sh` (the mount uses `create_host_path: false` so Docker
   cannot silently create a directory there).
+- **`llama.cpp does not support 'previous_response_id'`** — the pin map predates
+  the Responses bridge. Re-run `./reload-models.sh`. Even after that, `/v1/responses`
+  is bridged to `/chat/completions` and `previous_response_id` is dropped, so
+  Responses conversation continuation is unavailable; send the full message history.
 - **An OTEL export error per request** — no collector at `OTEL_ENDPOINT`.
   Comment out the `otel` callback in `litellm/config.yaml`.
 - **Is LiteLLM the problem, or the router?** — `docker compose logs llama-1 llama-2`
