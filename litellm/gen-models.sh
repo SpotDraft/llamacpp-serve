@@ -175,6 +175,11 @@ emit_deployment() {
   # LiteLLM requires a non-empty key.
   echo "      api_key: \"none\""
   echo "      max_parallel_requests: $MAX_PARALLEL"
+  # openai/ + custom api_base makes LiteLLM forward /v1/responses (and
+  # previous_response_id) straight to llama-server, which rejects it.
+  # Bridge to /chat/completions and drop the param if a client still sends it.
+  echo "      use_chat_completions_api: true"
+  echo "      additional_drop_params: [\"previous_response_id\"]"
   echo "    model_info:"
   # Stable per-deployment id, so spend logs and the Admin UI show which
   # router actually served a request.

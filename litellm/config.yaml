@@ -25,6 +25,10 @@ litellm_settings:
 
   # llama-server rejects a few OpenAI-only sampling params. Drop them rather
   # than failing the request, so stock OpenAI clients work unmodified.
+  # Not enough on its own: the openai/ prefix claims to support the Responses
+  # API, so previous_response_id is treated as valid and forwarded. Each
+  # generated deployment also sets use_chat_completions_api and
+  # additional_drop_params (see litellm/gen-models.sh).
   drop_params: true
 
   # A cold model has to load its weights into VRAM before it emits a token, so
