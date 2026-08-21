@@ -1,10 +1,10 @@
 # LiteLLM proxy configuration for llamacpp-serve.
 #
 # This file is hand-written and committed. The model_list is NOT here: it is
-# generated from the GGUFs in var/lib/llama by litellm/gen-models.sh and pulled
+# generated from the GGUFs in var/lib/llama by the scripts/ placement tools and pulled
 # in by the include below. Regenerate it whenever you add or remove a model:
 #
-#   ./litellm/gen-models.sh --reload
+#   scripts/apply-model-routing.sh
 #
 # Paths in `include` are resolved relative to this file, and both files are
 # mounted into /app/config/ in the container.
@@ -28,7 +28,7 @@ litellm_settings:
   # Not enough on its own: the openai/ prefix claims to support the Responses
   # API, so previous_response_id is treated as valid and forwarded. Each
   # generated deployment also sets use_chat_completions_api and
-  # additional_drop_params (see litellm/gen-models.sh).
+  # additional_drop_params (see generate-litellm-model-config.sh).
   drop_params: true
 
   # A cold model has to load its weights into VRAM before it emits a token, so
@@ -42,7 +42,7 @@ general_settings:
 
   # Persist models in Postgres so the Admin UI can add/edit them. The GGUF
   # pin map is still generated from disk; do not add a second api_base for a
-  # model that gen-models.sh already pinned (that would load the same weights
+  # model that the generated configuration already pinned (that would load the same weights
   # on both servers).
   store_model_in_db: true
 
@@ -68,7 +68,7 @@ general_settings:
   background_health_checks: false
 
 router_settings:
-  # gen-models.sh emits exactly one api_base per model (llama-1 or llama-2),
+  # The generator emits exactly one api_base per model (llama-1 or llama-2),
   # so this never load-balances a GGUF onto both servers. least-busy is a
   # no-op with a single deployment; do not add a second api_base for the
   # same model_name.

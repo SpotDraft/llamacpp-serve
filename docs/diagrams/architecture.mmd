@@ -12,9 +12,9 @@ flowchart TD
         end
 
         subgraph NET["bridge network llama"]
-            subgraph POOL["llama.cpp - 2 instances, 1 GGUF each"]
-                L1["llama-1<br/>router :8080"]
-                L2["llama-2<br/>router :8080"]
+            subgraph POOL["llama.cpp - 2 instances, up to 2 resident GGUFs each"]
+                L1["llama-1<br/>router :8080<br/>LRU capacity 2"]
+                L2["llama-2<br/>router :8080<br/>LRU capacity 2"]
             end
             subgraph SOC["socat bridges -> unix sockets"]
                 S1["socat-1<br/>llama-1.sock"]
@@ -25,7 +25,7 @@ flowchart TD
         end
 
         GPU["NVIDIA GB10 GPU<br/>(CDI: nvidia.com/gpu=all)"]
-        MODELS["var/lib/llama<br/>at most 2 GGUFs"]
+        MODELS["var/lib/llama<br/>all standalone GGUFs discovered"]
         DATA["var/lib/webui<br/>SQLite + uploads"]
     end
 

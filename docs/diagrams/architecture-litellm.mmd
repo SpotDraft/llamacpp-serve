@@ -12,9 +12,9 @@ flowchart TD
         subgraph NET["bridge network llama"]
             SL["socat-litellm<br/>litellm.sock"]
             LL["<b>litellm</b> :4000<br/>auth - rate limits - pinning"]
-            subgraph POOL["llama.cpp - 2 GGUFs max, not published"]
-                L1["llama-1<br/>pinned model A"]
-                L2["llama-2<br/>pinned model B"]
+            subgraph POOL["llama.cpp - 4 GGUFs max, not published"]
+                L1["llama-1<br/>up to 2 assigned models"]
+                L2["llama-2<br/>up to 2 assigned models"]
             end
             W["webui<br/>:8080"]
             SW["socat-webui<br/>webui.sock"]
@@ -33,8 +33,8 @@ flowchart TD
     LS11437 -.->|litellm.sock| SL
     SL -->|TCP :4000| LL
     GEN -.->|include: model_list| LL
-    LL -->|"pinned GGUF A"| L1
-    LL -->|"pinned GGUF B"| L2
+    LL -->|"pinned GGUFs A/B"| L1
+    LL -->|"pinned GGUFs C/D"| L2
     LL --> PG
 
     LS11438 -.->|webui.sock| SW

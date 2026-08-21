@@ -33,21 +33,20 @@ x-llama-base: &llama-base
   # Router mode (no LLAMA_ARG_MODEL): every standalone .gguf in var/lib/llama/
   # (mounted /models) is discovered at startup and advertised on /v1/models.
   #
-  # LLAMA_ARG_MODELS_MAX=1 bounds how many models are *resident* per router,
-  # not how many are discovered: drop in a third GGUF and both routers will
-  # still serve all three, LRU-evicting to keep one loaded each. That is a
+  # LLAMA_ARG_MODELS_MAX=2 bounds how many models are *resident* per router,
+  # not how many are discovered: drop in a fifth GGUF and both routers will
+  # still serve all five, LRU-evicting to keep two loaded each. That is a
   # supported default-stack configuration, it just trades VRAM churn for
   # breadth.
   #
-  # The "one GGUF per router" limit belongs to the LiteLLM overlay, which
-  # pins each model to exactly one api_base (litellm/gen-models.sh) so the
-  # two servers never load the same weights. That generator is the thing
-  # that caps the count at 2 -- this file does not.
+  # The LiteLLM path pins each model to exactly one api_base using
+  # scripts/apply-model-routing.sh, with at most two models on each router.
+  # This file does not cap how many GGUFs the default stack discovers.
   environment:
     LLAMA_ARG_HOST: 0.0.0.0
     LLAMA_ARG_PORT: "8080"
     LLAMA_ARG_MODELS_DIR: /models
-    LLAMA_ARG_MODELS_MAX: "1"
+    LLAMA_ARG_MODELS_MAX: "2"
     LLAMA_ARG_CONTEXT_SIZE: "32768"
     LLAMA_ARG_N_GPU_LAYERS: "999"
     LLAMA_ARG_PARALLEL: "2"
