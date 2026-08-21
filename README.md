@@ -1,61 +1,59 @@
 # llamacpp-serve
 
-A self-hosted, TLS-only [llama.cpp](https://github.com/ggml-org/llama.cpp) serving
-stack for a single GPU host (NVIDIA DGX Spark / GB10). It runs two `llama-server`
-instances in **router mode** behind an nginx reverse proxy with dynamic,
-health-checked upstreams, plus Open WebUI for a browser interface. Every path
-into the stack is HTTPS; nothing is published as plain HTTP.
+Self-hosted, TLS-only [llama.cpp](https://github.com/ggml-org/llama.cpp) serving
+for a single-GPU host: two `llama-server` routers behind nginx with
+health-checked upstreams, Open WebUI for a browser interface, and an optional
+[LiteLLM](https://github.com/BerriAI/litellm) gateway for auth, rate limits and
+spend logs. Every entry point is HTTPS; nothing is published as plain HTTP.
 
-An optional [LiteLLM](https://github.com/BerriAI/litellm) gateway can sit in
-front of the GPU for auth, rate limits, concurrency caps and observability.
-It is off by default — `docker compose up` does not start it. Enable it by
-appending `docker-compose.litellm.yml` to `COMPOSE_FILE`. New installs should
-follow the [first-time setup](#first-time-setup).
-
-## Highlights
-
-- **2 GPU `llama-server` instances** on the same DGX Spark, each with full
-  GPU access via NVIDIA CDI (`nvidia.com/gpu=all`) and a **32768** context.
-- **Two resident models per router** — `LLAMA_ARG_MODELS_MAX=2` caps how many
-  models each `llama-server` keeps loaded, not how many it discovers. The
-  default stack serves every standalone `.gguf` in `var/lib/llama` and
-  LRU-evicts as needed.
-- **At most four models *with LiteLLM*** — the placement CLI assigns at most
-  two GGUFs to each router and emits one `api_base` per model. The default
-  stack has no discovery limit.
-- **Shared model store** — both routers mount the same `var/lib/llama` host
-  directory, so each GGUF lives on disk exactly once.
-- **OpenAI-compatible API** — `llama-server` exposes `/v1/chat/completions`,
-  `/v1/models`, and a `/health` endpoint, so any OpenAI client (and Open WebUI)
-  can talk to it.
-- **Two dedicated routers** — two resident GGUFs each. A restart of `llama-1`
-  only takes down its assigned models; `llama-2` keeps serving its pair.
-- **Dynamic upstream pool (default stack only)** — `healthcheck.sh` probes each
-  instance's socket every 5 s and regenerates the nginx upstream, reloading only
-  on change. Failed instances are dropped from the pool automatically. With the
-  LiteLLM overlay nginx has no `llama_pool` at all — LiteLLM does the routing
-  and the watcher is not run.
-- **Request correlation** — nginx honours an inbound `X-Request-ID` (or mints
-  one), forwards it upstream, echoes it back on the response, and logs it as
-  `rid=` so a client-visible id ties the access log to the gateway log.
-- **Pinned models with LiteLLM** — each GGUF has one `api_base`. LiteLLM always
-  sends that model to its home `llama-server` and never fail over onto the
-  neighbour (that would put two GGUFs on one GPU). Without LiteLLM, nginx
-  round-robins and *can* load the same GGUF on both servers.
-- **HTTPS-only entry points** on `:11437` (llama.cpp API) and `:11438` (Open WebUI),
-  served by a self-signed local CA.
-- **Hardened containers** — non-root user (`1000:1000`), `no-new-privileges`,
-  and `cap_drop: ALL` on every default service.
-- **No TCP ports published** except through nginx: containers talk over unix
-  sockets bridged by socat.
-- **Optional LiteLLM compose file** — auth, per-key RPM/TPM/budgets, concurrency
-  caps, spend logs and OpenTelemetry, without changing the llama.cpp routers.
-
-## Architecture
+> [!IMPORTANT]
+> **Requires an NVIDIA GPU with Container Toolkit + CDI enabled**
+> (`driver: cdi`, `nvidia.com/gpu=all`). Built for a DGX Spark / GB10 — the
+> CUDA image and CDI reservation do not run on Docker Desktop or CPU-only
+> hosts. Also needs Docker Compose v2.24+ (for `env_file: required` and
+> `!override`).
 
 ![Architecture](docs/diagrams/architecture.svg)
 
-### Services and ports
+## Quickstart
+
+The base stack — no authentication, smallest setup. Run from the repository root.
+
+```sh
+scripts/setup-base-stack.sh                              # runtime dirs + local TLS CA
+cp ~/qwen2.5-7b-instruct-q4_k_m.gguf var/lib/llama/      # filename minus .gguf = model ID
+docker compose -f docker-compose.yml up --build -d
+curl -k https://localhost:11437/v1/models
+```
+
+Open WebUI at <https://localhost:11438> and create the first admin account.
+
+Want API keys, per-key rate limits, budgets, spend logs and an admin UI?
+Use the [LiteLLM stack](#option-b-full-litellm-stack) instead — it is off by
+default and `docker compose up` does not start it.
+
+## Features
+
+- **Two GPU `llama-server` instances in router mode**, each with full GPU access
+  via NVIDIA CDI (`nvidia.com/gpu=all`), a 32768 context, and up to two resident
+  models. Models load on demand into child processes and LRU-evict.
+- **Shared model store** — both routers mount the same `var/lib/llama`, so each
+  GGUF lives on disk exactly once.
+- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/models`, `/health`,
+  so any OpenAI client (and Open WebUI) can talk to it.
+- **Self-healing upstreams** — `healthcheck.sh` probes each router every 5 s and
+  regenerates the nginx upstream, reloading only on change. A crashed router
+  leaves the pool with zero downtime.
+- **Hardened by default** — TLS-only, non-root (`1000:1000`),
+  `no-new-privileges`, `cap_drop: ALL`, and no published TCP ports except
+  nginx's two; containers talk over unix sockets bridged by socat.
+- **Request correlation** — nginx honours or mints an `X-Request-ID`, forwards
+  it upstream, echoes it back, and logs it as `rid=`.
+- **Optional LiteLLM gateway** — auth, per-key RPM/TPM/budgets, concurrency
+  caps, spend logs and OpenTelemetry, with each GGUF pinned to one router.
+  No changes to the llama.cpp routers.
+
+## Architecture
 
 | Service       | Container port | Host exposure                                  | Purpose                          |
 | ------------- | -------------- | ---------------------------------------------- | -------------------------------- |
@@ -64,6 +62,9 @@ follow the [first-time setup](#first-time-setup).
 | `socat-1..2`  | —              | `var/run/sockets/llama-N.sock` (unix)          | Bridge TCP `:8080` to sockets    |
 | `webui`       | `:8080`        | none (reached via unix socket)                 | Open WebUI                       |
 | `socat-webui` | —              | `var/run/sockets/webui.sock` (unix)            | Bridge TCP `:8080` to a socket   |
+
+<details>
+<summary><b>Request flows and health checking</b> — how a request reaches the GPU</summary>
 
 ### Request flow (llama.cpp API)
 
@@ -86,6 +87,11 @@ the host) over TLS, using the CA baked into its image. The server certificate
 includes `DNS:host.docker.internal` in its SANs; Linux containers get that name
 via `extra_hosts: host.docker.internal:host-gateway`.
 
+With the LiteLLM overlay the same path runs through the gateway, so the WebUI
+inherits its limits:
+
+![WebUI request flow with LiteLLM](docs/diagrams/webui-flow-litellm.svg)
+
 ### Health checks and automatic failover
 
 ![Health check loop](docs/diagrams/healthcheck.svg)
@@ -96,7 +102,13 @@ via `extra_hosts: host.docker.internal:host-gateway`.
 router is removed from the pool with zero downtime. When no router is healthy
 the upstream keeps a placeholder `none.sock` so nginx stays valid.
 
-## Repository layout
+This watcher belongs to the default stack only. With the LiteLLM overlay nginx
+has no `llama_pool` at all: LiteLLM does the routing and the watcher is not run.
+
+</details>
+
+<details>
+<summary><b>Repository layout</b></summary>
 
 ```
 ├── docker-compose.yml           # Default stack (llama.cpp + webui + nginx)
@@ -127,13 +139,7 @@ the upstream keeps a placeholder `none.sock` so nginx stays valid.
 └── opencode.json.example        # LiteLLM-authenticated OpenCode example
 ```
 
-## Prerequisites
-
-- Docker + Docker Compose (v2.24+, for `env_file: required` / `!override`).
-- NVIDIA Container Toolkit with CDI enabled (`driver: cdi`, `nvidia.com/gpu=all`).
-
-This stack is built for a **DGX Spark**. The CUDA image and CDI reservation
-do not run on Docker Desktop / machines without an NVIDIA GPU.
+</details>
 
 ## First-time setup
 
@@ -147,6 +153,9 @@ Run all commands from the repository root. Choose **one** stack:
 The LiteLLM setup already invokes the base setup. Do not run both setup scripts.
 
 ### Option A: base llama.cpp stack
+
+<details>
+<summary>Four commands — same as the quickstart above, with verification</summary>
 
 1. Create the runtime directories and local TLS certificates:
 
@@ -180,14 +189,28 @@ curl -k -H 'Content-Type: application/json' \
 
 Open WebUI at <https://localhost:11438> and create its first admin account.
 
+</details>
+
 ### Option B: full LiteLLM stack
 
-1. Create the base runtime, TLS certificates, `.env`, generated secrets,
-   LiteLLM runtime and an initial empty model configuration:
+<details>
+<summary>Six steps — setup, enable the overlay, place models, start, verify</summary>
+
+1. Create the base runtime, TLS certificates, `.env`, generated secrets and the
+   LiteLLM runtime. **Run this before copying any GGUF into the model store**
+   (see step 3):
 
 ```sh
 scripts/setup-litellm-stack.sh --auto --yes
 ```
+
+This does not assign any models — the store is still empty. It writes a
+placeholder `var/run/litellm/models.generated.yaml` containing `model_list: []`,
+which exists only so the LiteLLM bind mount resolves:
+`docker-compose.litellm.yml` mounts that path with `create_host_path: false`,
+so the file must already exist as a file or `docker compose up` fails. Step 4
+is what actually populates it. The `--auto --yes` flags only keep this nested
+placement call non-interactive; with zero models there is nothing to place.
 
 2. Enable the overlay for subsequent `docker compose` and model-routing
    commands. In `.env`, uncomment or add exactly this line:
@@ -211,7 +234,15 @@ scripts/apply-model-routing.sh --no-restart
 ```
 
 Review the proposed placement and confirm it. The command writes the persistent
-placement and generated LiteLLM model list.
+placement (`var/lib/llama/model-routing.tsv`) and the generated LiteLLM model
+list.
+
+> [!NOTE]
+> **If you copied GGUFs in before step 1**, that step's inherited `--auto`
+> already placed them by round-robin and, as auto mode always does, left no
+> `model-routing.tsv` behind. This step then starts from no defaults — the
+> `[1/2, current N]` prompts will not appear. Assign every model explicitly
+> here, or re-run with `--auto --yes` to accept round-robin placement.
 
 5. Build and start the full stack:
 
@@ -232,6 +263,8 @@ Open the LiteLLM Admin UI at <https://localhost:11437/ui> using
 <https://localhost:11438>. Create a dedicated LiteLLM virtual key after the
 first login; the generated master key should be used only for administration.
 
+</details>
+
 ### After the first start
 
 - **Base stack:** after adding or removing a GGUF, restart discovery with
@@ -244,12 +277,15 @@ first login; the generated master key should be used only for administration.
 - Stop and remove containers with `docker compose down`. Runtime data, models
   and Postgres are preserved unless you explicitly remove their volumes/files.
 
-## Configuration knobs
+## Configuration
+
+<details>
+<summary><b>Configuration knobs</b> — llama.cpp, nginx, WebUI, compose</summary>
 
 | Setting                               | Where                         | Effect                                   |
 | ------------------------------------- | ----------------------------- | ---------------------------------------- |
 | `LLAMA_ARG_MODELS_DIR=/models`        | compose `x-llama-base`        | Directory scanned for `.gguf` models (router mode) |
-| `LLAMA_ARG_MODELS_MAX=2`              | compose `x-llama-base`        | Max models resident at once per router |
+| `LLAMA_ARG_MODELS_MAX=2`              | compose `x-llama-base`        | Max models resident per router — caps how many stay *loaded*, not how many are discovered; the base stack serves every standalone `.gguf` and LRU-evicts past this |
 | `LLAMA_ARG_CONTEXT_SIZE=32768`        | compose `x-llama-base`        | Context window inherited by every loaded model |
 | `LLAMA_ARG_N_GPU_LAYERS=999`          | compose `x-llama-base`        | Offload all layers to the GPU (inherited) |
 | `LLAMA_ARG_PARALLEL=2`                | compose `x-llama-base`        | Concurrent slots per loaded model (inherited) |
@@ -266,7 +302,10 @@ of at most four GGUFs to one router, with a maximum of two assignments per
 router. Without LiteLLM, nginx round-robin can still place the same GGUF on
 both routers; explicit placement applies only to the LiteLLM path.
 
-## Trusting the CA
+</details>
+
+<details>
+<summary><b>Trusting the CA</b> — host, browsers, WebUI, OpenCode</summary>
 
 - **Host / browsers**: add `nginx/certs/ca.crt` to your system/browser trust
   store, then `https://localhost:11437` and `https://localhost:11438` validate
@@ -291,6 +330,8 @@ both routers; explicit placement applies only to the LiteLLM path.
   Use a virtual key from the Admin UI for normal clients. The master key is
   suitable only for initial bootstrap and administration.
 
+</details>
+
 ## Optional: LiteLLM gateway
 
 LiteLLM is **not** part of the default stack. Enable it when you want every
@@ -313,6 +354,9 @@ the overlay before its setup and model-routing commands have generated
 
 llama.cpp is not published. Clients and Open WebUI only reach the GPU through
 LiteLLM on `:11437`.
+
+<details>
+<summary><b>How the gateway path works</b> — request flow, Postgres, Responses API limits</summary>
 
 Postgres is **bundled** (no host port). LiteLLM keeps virtual keys, teams,
 budgets, rate-limit counters and spend logs there, and migrates its own schema
@@ -345,7 +389,10 @@ Open WebUI keeps calling `:11437`, so it inherits the limits automatically
 via `LITELLM_WEBUI_KEY`. `scripts/setup-litellm-stack.sh` bootstraps that to
 the master key; create a dedicated virtual key in the Admin UI afterwards.
 
-### Adding or removing a model
+</details>
+
+<details id="adding-or-removing-a-model">
+<summary><b>Adding or removing a model</b> — the placement CLI and what <code>--auto</code> costs you</summary>
 
 `llama-server` scans `var/lib/llama` only at startup, and LiteLLM reads its
 generated `model_list` only at startup, so both need restarting:
@@ -368,9 +415,10 @@ Instance for big-b [1/2]: 2
 Instance for small-b [1/2]: 2
 ```
 
-On subsequent runs, the current assignment is the default; press Enter to keep
-it. For unattended use, assign every model explicitly or use deterministic
-filename-sorted round-robin:
+On subsequent runs the current assignment is offered as the default — press
+Enter to keep it. This requires a persisted `model-routing.tsv`, so it does not
+apply after an `--auto` run (see below). For unattended use, assign every model
+explicitly or use filename-sorted round-robin:
 
 ```sh
 scripts/apply-model-routing.sh \
@@ -381,6 +429,23 @@ scripts/apply-model-routing.sh --auto --yes
 scripts/apply-model-routing.sh --dry-run
 ```
 
+> [!WARNING]
+> **`--auto` does not persist placement.** Interactive and `--assign` runs write
+> `var/lib/llama/model-routing.tsv`; `--auto` deletes it and recomputes
+> round-robin from the sorted filenames on every run. Two consequences:
+>
+> - Adding or renaming a GGUF can **move models that were already placed**,
+>   since a name that sorts earlier shifts everything after it to the other
+>   router. A model's home router is only stable across runs if placement is
+>   persisted.
+> - `--auto` runs are not resumable: the next interactive run has no defaults
+>   to offer and asks for every model again.
+>
+> The generated config records which mode produced it — the `# Routing:` header
+> in `models.generated.yaml` is either a path to the TSV or the literal
+> `automatic filename-sorted round-robin`. Prefer `--assign` for anything you
+> intend to keep.
+
 If you select the overlay with explicit `-f` flags instead of `COMPOSE_FILE`,
 pass those flags to the command. Restarts happen in place; the script never
 uses `compose down`, which could reap overlay services as orphans.
@@ -388,7 +453,10 @@ uses `compose down`, which could reap overlay services as orphans.
 GGUF filenames must be valid model IDs: letters, digits, `.`, `_`, `+` and
 `-` only, with no leading `-`. Shards are skipped.
 
-### Governing GPU access
+</details>
+
+<details>
+<summary><b>Governing GPU access</b> — the layered concurrency and spend controls</summary>
 
 The controls stack from broadest to narrowest — a request has to clear all of
 them.
@@ -420,7 +488,10 @@ curl -k -X POST https://localhost:11437/key/generate \
   -d '{"key_alias": "batch-job", "rpm_limit": 10, "tpm_limit": 100000, "max_budget": 0}'
 ```
 
-### Observability
+</details>
+
+<details>
+<summary><b>Observability</b> — Admin UI, OpenTelemetry, structured logs</summary>
 
 - **Admin UI** (<https://localhost:11437/ui>) — per-key and per-model request
   logs, token usage, latency and error rates, backed by the spend log in
@@ -436,12 +507,15 @@ curl -k -X POST https://localhost:11437/key/generate \
 Prometheus `/metrics` is a [LiteLLM enterprise feature](https://docs.litellm.ai/docs/proxy/prometheus)
 and is not wired up here; the OTEL exporter covers the same ground for free.
 
-### LiteLLM knobs
+</details>
+
+<details>
+<summary><b>LiteLLM knobs</b></summary>
 
 | Setting                             | Where                   | Effect                                        |
 | ----------------------------------- | ----------------------- | --------------------------------------------- |
-| `global_max_parallel_requests: 4`   | `litellm/config.yaml`   | Proxy-wide in-flight ceiling; intentionally unchanged |
-| `routing_strategy: least-busy`      | `litellm/config.yaml`   | Unused with one `api_base` per model                |
+| `global_max_parallel_requests: 4`   | `litellm/config.yaml`   | Proxy-wide in-flight ceiling                   |
+| `routing_strategy: least-busy`      | `litellm/config.yaml`   | Inert here — one `api_base` per model means there is nothing to balance |
 | `num_retries: 1`                    | `litellm/config.yaml`   | Retry the pinned router; no cross-server failover   |
 | `request_timeout: 600`              | `litellm/config.yaml`   | Per-request timeout (matches nginx)                 |
 | `callbacks` (off by default)        | `litellm/config.yaml`   | Uncomment `["otel"]` when a collector is running    |
@@ -450,17 +524,22 @@ and is not wired up here; the OTEL exporter covers the same ground for free.
 | `MAX_PARALLEL` (default 2)          | model config generator | Per-deployment concurrency; match `LLAMA_ARG_PARALLEL` |
 | `use_chat_completions_api: true`    | generated per model     | Bridges `/v1/responses` to llama.cpp `/chat/completions` |
 | `additional_drop_params`            | generated per model     | Drops `previous_response_id` (llama.cpp rejects it) |
-| `model-routing.tsv`                 | `var/lib/llama/`        | Persistent model-to-router assignments            |
+| `model-routing.tsv`                 | `var/lib/llama/`        | Persistent model-to-router assignments; not written by `--auto` |
 | `LITELLM_MASTER_KEY` / `LITELLM_SALT_KEY` | `.env`            | Admin credential / credential encryption key  |
 | `UI_USERNAME` / `UI_PASSWORD`       | `.env`                  | Admin UI login                                |
 | `LITELLM_WEBUI_KEY`                 | `.env`                  | Virtual key Open WebUI authenticates with     |
 | `OTEL_EXPORTER` / `OTEL_ENDPOINT` / `OTEL_HEADERS` | `.env`   | Where traces are exported                     |
 
-LiteLLM's own `background_health_checks` is deliberately **off**. It works by
+LiteLLM's own `background_health_checks` is deliberately off. It works by
 sending a real completion to every entry in `model_list`, which under router
 mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 
+</details>
+
 ## Troubleshooting
+
+<details>
+<summary><b>Base stack</b> — upstreams, model discovery, TLS, permissions, CUDA</summary>
 
 - **Upstream empty / all routers down** — check `var/run/nginx/upstream.conf`;
   the health checker only lists sockets whose `/health` probe succeeds. Verify
@@ -499,7 +578,10 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - **CUDA / CDI errors** — this stack needs NVIDIA Container Toolkit with CDI
   on a DGX Spark. `nvidia.com/gpu=all` must be visible to Docker.
 
-### LiteLLM
+</details>
+
+<details>
+<summary><b>LiteLLM</b> — auth, Postgres, generated config, OTEL</summary>
 
 - **`401` / `400 Authentication Error`** — `:11437` requires a LiteLLM key
   when that compose file is in use. Pass `Authorization: Bearer sk-...`.
@@ -508,7 +590,9 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
   before LiteLLM migrates.
 - **`bind source path does not exist: .../models.generated.yaml`** — run
   `scripts/apply-model-routing.sh` (the mount uses `create_host_path: false`
-  so Docker cannot silently create a directory there).
+  so Docker cannot silently create a directory there). On a new install
+  `scripts/setup-litellm-stack.sh` creates this file as an empty
+  `model_list: []` placeholder; this error means that step was skipped.
 - **`llama.cpp does not support 'previous_response_id'`** — the pin map predates
   the Responses bridge. Re-run `scripts/apply-model-routing.sh`. Even after that, `/v1/responses`
   is bridged to `/chat/completions` and `previous_response_id` is dropped, so
@@ -518,6 +602,8 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - **Is LiteLLM the problem, or the router?** — `docker compose logs llama-1 llama-2`
   vs `docker compose logs litellm`. A 401/400 on `:11437` is LiteLLM auth;
   a 502 with LiteLLM up usually means the pinned router is down.
+
+</details>
 
 ## Security notes
 
@@ -529,7 +615,8 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - Data mounts (`var/lib/llama`, `var/lib/webui`) are plain host directories and
   contain model weights and user chat data; back them up accordingly.
 
-With `docker-compose.litellm.yml`:
+<details>
+<summary><b>With <code>docker-compose.litellm.yml</code></b> — auth boundary, network segmentation, pinned images</summary>
 
 - **`:11437` is authenticated** — LiteLLM rejects requests without a valid
   virtual key. Keep `LITELLM_MASTER_KEY` for administration only. llama.cpp
@@ -565,7 +652,10 @@ With `docker-compose.litellm.yml`:
   llama.cpp image deliberately stays on the rolling `server-cuda` tag; see the
   comment in `docker-compose.yml` for how to pin it too.
 
-### Rotating the bundled Postgres password
+</details>
+
+<details>
+<summary><b>Rotating the bundled Postgres password</b></summary>
 
 `LITELLM_DB_PASSWORD` in `.env` feeds both `POSTGRES_PASSWORD` and LiteLLM's
 `DATABASE_URL`. Postgres only applies `POSTGRES_PASSWORD` when `initdb` runs on
@@ -586,3 +676,5 @@ volume — that discards virtual keys, teams, budgets and spend history.
 
 If `.env` is lost while the Postgres volume survives, the LiteLLM setup detects
 the volume and falls back to the historical `litellm` password.
+
+</details>
