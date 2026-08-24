@@ -14,15 +14,30 @@ mkdir -p nginx/certs
 echo "Base directories created."
 
 # host.docker.internal is how WebUI reaches nginx over verified TLS.
-CERT_SANS="DNS:localhost, DNS:host.docker.internal, IP:127.0.0.1"
+# The tailnet name is how off-box clients (OpenCode, sandboxes) reach the DGX;
+# without it they fail hostname verification even after trusting our CA.
+# CERT_EXTRA_SANS adds names without editing this file, e.g.
+#   CERT_EXTRA_SANS="DNS:other.example.com, IP:10.0.0.5" scripts/setup-base-stack.sh
+CERT_SANS="DNS:localhost, DNS:host.docker.internal, DNS:spotdraft-dgx.tailnet.spotdraftteam.com, IP:127.0.0.1, IP:100.64.0.1"
+[ -n "${CERT_EXTRA_SANS:-}" ] && CERT_SANS="$CERT_SANS, $CERT_EXTRA_SANS"
 REISSUED=0
 CA_NEW=0
 
+# Stale = the live cert is missing any name in $CERT_SANS. Derived from
+# CERT_SANS rather than hardcoding one name: a fixed probe reports "current"
+# for a cert that predates a newly added SAN, so the new name never gets issued.
 cert_is_stale() {
     [ -f nginx/certs/server.crt ] || return 0
-    openssl x509 -in nginx/certs/server.crt -noout -ext subjectAltName 2>/dev/null \
-      | grep -q 'host\.docker\.internal' && return 1
-    return 0
+    _live=$(openssl x509 -in nginx/certs/server.crt -noout -ext subjectAltName 2>/dev/null) || return 0
+    # openssl prints "IP Address:1.2.3.4" where CERT_SANS says "IP:1.2.3.4".
+    _live=$(printf '%s\n' "$_live" | sed 's/IP Address:/IP:/g' | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '^(DNS|IP):')
+    for _san in $(printf '%s\n' "$CERT_SANS" | tr ',' '\n' \
+                  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'); do
+        [ -n "$_san" ] || continue
+        printf '%s\n' "$_live" | grep -qxF -- "$_san" || return 0
+    done
+    return 1
 }
 
 cert_ca_mismatch() {
@@ -56,7 +71,7 @@ if [ ! -f nginx/certs/server.key ] || [ ! -f nginx/certs/server.crt ] \
    || cert_key_mismatch; then
     if [ -f nginx/certs/server.crt ]; then
         if cert_is_stale; then
-            echo "Existing server.crt lacks DNS:host.docker.internal."
+            echo "Existing server.crt is missing one or more names in CERT_SANS."
         elif cert_key_mismatch; then
             echo "Existing server.key is invalid or does not match server.crt."
         else
