@@ -17,6 +17,9 @@ ca-certificates.crt
 *.jks
 *.keystore
 
+# Local operator config (ship opencode.json.example instead)
+opencode.json
+
 # Docker
 docker-compose.override.yml
 
