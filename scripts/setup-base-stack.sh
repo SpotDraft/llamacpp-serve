@@ -13,13 +13,26 @@ mkdir -p var/run/nginx
 mkdir -p nginx/certs
 echo "Base directories created."
 
-# host.docker.internal is how WebUI reaches nginx over verified TLS.
-# The tailnet name is how off-box clients (OpenCode, sandboxes) reach the DGX;
-# without it they fail hostname verification even after trusting our CA.
-# CERT_EXTRA_SANS adds names without editing this file, e.g.
-#   CERT_EXTRA_SANS="DNS:other.example.com, IP:10.0.0.5" scripts/setup-base-stack.sh
-CERT_SANS="DNS:localhost, DNS:host.docker.internal, DNS:spotdraft-dgx.tailnet.spotdraftteam.com, IP:127.0.0.1, IP:100.64.0.1"
-[ -n "${CERT_EXTRA_SANS:-}" ] && CERT_SANS="$CERT_SANS, $CERT_EXTRA_SANS"
+# Read a setting from the environment first, then .env, so both work:
+#   CERT_HOSTNAME=dgx.example.com scripts/setup-base-stack.sh
+env_or_dotenv() {
+    eval "_v=\${$1:-}"
+    if [ -z "$_v" ] && [ -f .env ]; then
+        _v=$(sed -n "s|^$1=\(.\{1,\}\)$|\1|p" .env | head -1)
+    fi
+    printf '%s' "$_v"
+}
+
+# TLS SANs. localhost / host.docker.internal / 127.0.0.1 are always present:
+# WebUI and the health checks reach nginx by those names. Any OTHER name a
+# client connects by -- a tailnet name, a LAN IP -- must be declared here, or
+# that client fails hostname verification even after trusting our CA.
+CERT_HOSTNAME=$(env_or_dotenv CERT_HOSTNAME)
+CERT_EXTRA_SANS=$(env_or_dotenv CERT_EXTRA_SANS)
+
+CERT_SANS="DNS:localhost, DNS:host.docker.internal, IP:127.0.0.1"
+[ -n "$CERT_HOSTNAME" ] && CERT_SANS="$CERT_SANS, DNS:$CERT_HOSTNAME"
+[ -n "$CERT_EXTRA_SANS" ] && CERT_SANS="$CERT_SANS, $CERT_EXTRA_SANS"
 REISSUED=0
 CA_NEW=0
 

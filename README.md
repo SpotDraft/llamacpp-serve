@@ -285,10 +285,13 @@ first login; the generated master key should be used only for administration.
 | Setting                               | Where                         | Effect                                   |
 | ------------------------------------- | ----------------------------- | ---------------------------------------- |
 | `LLAMA_ARG_MODELS_DIR=/models`        | compose `x-llama-base`        | Directory scanned for `.gguf` models (router mode) |
-| `LLAMA_ARG_MODELS_MAX=2`              | compose `x-llama-base`        | Max models resident per router — caps how many stay *loaded*, not how many are discovered; the base stack serves every standalone `.gguf` and LRU-evicts past this |
-| `LLAMA_ARG_CONTEXT_SIZE=32768`        | compose `x-llama-base`        | Context window inherited by every loaded model |
-| `LLAMA_ARG_N_GPU_LAYERS=999`          | compose `x-llama-base`        | Offload all layers to the GPU (inherited) |
-| `LLAMA_ARG_PARALLEL=2`                | compose `x-llama-base`        | Concurrent slots per loaded model (inherited) |
+| `LLAMA_MODELS_MAX=2`                  | `.env`                        | Max models resident per router — caps how many stay *loaded*, not how many are discovered; the base stack serves every standalone `.gguf` and LRU-evicts past this |
+| `LLAMA_CTX_SIZE=32768`                | `.env`                        | Context window inherited by every loaded model |
+| `LLAMA_N_GPU_LAYERS=999`              | `.env`                        | Offload all layers to the GPU (inherited); `0` for a CPU-only box |
+| `LLAMA_N_PARALLEL=2`                  | `.env`                        | Concurrent slots per loaded model (inherited) |
+| `LLAMA_FLASH_ATTN=on`                 | `.env`                        | Flash attention                          |
+| `CERT_HOSTNAME`                       | `.env`                        | Extra hostname in the TLS certificate — required for any client that is not on this box |
+| `CERT_EXTRA_SANS`                     | `.env`                        | Further SAN entries, comma-separated, each `DNS:`- or `IP:`-prefixed |
 | `LLAMA_ARG_MODELS_PRESET` (optional)  | compose `x-llama-base`        | Per-model config INI (context, aliases, sharded GGUFs) |
 | Number of instances (`llama-1`, `llama-2`) | compose `services`     | Two servers, up to two resident GGUFs each |
 | Round-robin / `keepalive 32`      | generated `upstream.conf`     | Load balancing + connection reuse |
@@ -296,11 +299,73 @@ first login; the generated master key should be used only for administration.
 | Probe interval (`INTERVAL=5`)         | `nginx/healthcheck.sh`        | Health-check cadence                     |
 | `COMPOSE_FILE`                        | `.env`                        | `docker-compose.litellm.yml` appended = LiteLLM on |
 
-With `LLAMA_ARG_MODELS_MAX=2`, the two routers can hold up to four model
+The `LLAMA_*` keys are mapped onto llama-server's own `LLAMA_ARG_*` variables
+in `docker-compose.yml`. Those upstream names are exact: it reads
+`LLAMA_ARG_CTX_SIZE` and `LLAMA_ARG_N_PARALLEL`, and a near-miss such as
+`LLAMA_ARG_CONTEXT_SIZE` is ignored **without any warning**, silently leaving
+you on llama.cpp's 4096 default. Check any new setting against
+`docker compose exec llama-1 llama-server --help` before adding it.
+
+With `LLAMA_MODELS_MAX=2`, the two routers can hold up to four model
 processes in memory. With LiteLLM, `scripts/apply-model-routing.sh` pins each
 of at most four GGUFs to one router, with a maximum of two assignments per
 router. Without LiteLLM, nginx round-robin can still place the same GGUF on
 both routers; explicit placement applies only to the LiteLLM path.
+
+</details>
+
+<details>
+<summary><b>Reaching the stack from another machine</b> — TLS certificate names</summary>
+
+nginx serves a certificate signed by the local CA in `nginx/certs/ca.crt`. A
+client has to clear **two** independent checks:
+
+1. **Trust the CA** — see "Trusting the CA" below.
+2. **Connect by a name in the certificate** — `localhost`,
+   `host.docker.internal` and `127.0.0.1` are always present. Any other name
+   must be declared up front.
+
+Miss the second and the handshake fails even though the CA is trusted, because
+hostname verification is separate from chain-of-trust. `curl` says
+`unable to get local issuer certificate`; Node clients (OpenCode, Pi) surface
+it as a generic *connection error*, which is easy to misread as the box being
+down or the API key being wrong.
+
+To reach the box as, say, `dgx.example.com`, set this in `.env`:
+
+```sh
+CERT_HOSTNAME=dgx.example.com
+# optional extras, comma-separated, each DNS:- or IP:-prefixed
+CERT_EXTRA_SANS=IP:100.64.0.1, DNS:dgx.internal
+```
+
+then reissue and restart nginx:
+
+```sh
+scripts/setup-base-stack.sh     # reissues only if a listed name is missing
+docker compose restart nginx
+```
+
+The CA and its key are preserved, so the WebUI image does **not** need
+rebuilding — `webui/Dockerfile` bakes in `ca.crt`, not the server certificate.
+Re-running with an unchanged `.env` is a no-op (`Server certificate is
+current.`).
+
+Verify before you go hunting elsewhere:
+
+```sh
+openssl s_client -connect dgx.example.com:11437 -servername dgx.example.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -ext subjectAltName
+curl https://dgx.example.com:11437/v1/models -H "Authorization: Bearer sk-..."
+```
+
+Use `curl` **without** `-k`. With `-k` this failure is invisible: the
+connection succeeds and you will conclude TLS is fine when it is not.
+
+If your tailnet runs on Headscale rather than Tailscale SaaS, note that
+`tailscale cert` cannot help here — Headscale does not broker the ACME
+challenge, and `tailscale status --json` reports `"CertDomains": null`. Adding
+the name to `CERT_HOSTNAME` is the supported path.
 
 </details>
 
@@ -464,15 +529,15 @@ them.
 | Control                        | Where                                | What it bounds |
 | ------------------------------ | ------------------------------------ | -------------- |
 | `global_max_parallel_requests` | `litellm/config.yaml`                | In-flight requests across the entire proxy. The hard backstop. |
-| `max_parallel_requests`        | generated per (model, router)         | In-flight requests to one model on one router. Set to `LLAMA_ARG_PARALLEL`. |
+| `max_parallel_requests`        | generated per (model, router)         | In-flight requests to one model on one router. Set to `LLAMA_N_PARALLEL`. |
 | Key / team RPM, TPM, budget    | Admin UI or `/key/generate`          | What one client may consume per minute, and its spend ceiling. |
 | `allowed_fails` / `cooldown_time` | `litellm/config.yaml`             | How fast a failing *pinned* router is pulled out of rotation. |
 | One `api_base` per GGUF             | generated model config             | Explicit pin onto `llama-1` or `llama-2`. |
 
-Keep `max_parallel_requests` equal to `LLAMA_ARG_PARALLEL` (the generator's
+Keep `max_parallel_requests` equal to `LLAMA_N_PARALLEL` (the generator's
 default) so the queue forms in LiteLLM — where it is observable and subject to
 the key's limits — instead of inside `llama-server`. If you change
-`LLAMA_ARG_PARALLEL` in `docker-compose.yml`, regenerate with a matching
+`LLAMA_N_PARALLEL` in `.env`, regenerate with a matching
 `MAX_PARALLEL`:
 
 ```sh
@@ -521,7 +586,7 @@ and is not wired up here; the OTEL exporter covers the same ground for free.
 | `callbacks` (off by default)        | `litellm/config.yaml`   | Uncomment `["otel"]` when a collector is running    |
 | `store_model_in_db: true`           | `litellm/config.yaml`   | Persists models in Postgres so the Admin UI can add/edit them |
 | `background_health_checks: false`   | `litellm/config.yaml`   | **Leave off** — it would load every GGUF on a timer |
-| `MAX_PARALLEL` (default 2)          | model config generator | Per-deployment concurrency; match `LLAMA_ARG_PARALLEL` |
+| `MAX_PARALLEL` (default 2)          | model config generator | Per-deployment concurrency; defaults to `LLAMA_N_PARALLEL` |
 | `use_chat_completions_api: true`    | generated per model     | Bridges `/v1/responses` to llama.cpp `/chat/completions` |
 | `additional_drop_params`            | generated per model     | Drops `previous_response_id` (llama.cpp rejects it) |
 | `model-routing.tsv`                 | `var/lib/llama/`        | Persistent model-to-router assignments; not written by `--auto` |
@@ -552,7 +617,7 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
   request.
 - **First request to a model is slow** — models load on demand into a child
   process; subsequent requests to the same model are served from memory until
-  LRU-evicted (see `LLAMA_ARG_MODELS_MAX`).
+  LRU-evicted (see `LLAMA_MODELS_MAX`).
 - **Multi-file / sharded GGUFs** — `--models-dir` scans for standalone `.gguf`
   files only; for sharded models, define them in a presets INI
   (`LLAMA_ARG_MODELS_PRESET`) pointing at the first shard.
@@ -563,6 +628,26 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - **TLS verification failures from the webui** — the baked-in CA must match
   `nginx/certs/ca.crt`; rebuild the image after rotating the CA
   (`docker compose build webui`).
+- **TLS failures from another machine, or a client reporting a bare
+  "connection error"** — the certificate almost certainly does not carry the
+  name you are connecting by. Check it:
+
+  ```sh
+  openssl s_client -connect HOST:11437 -servername HOST </dev/null 2>/dev/null \
+    | openssl x509 -noout -subject -ext subjectAltName
+  ```
+
+  A stock cert shows `subject=CN=localhost` and only
+  `DNS:localhost, DNS:host.docker.internal, IP Address:127.0.0.1`. Set
+  `CERT_HOSTNAME` in `.env`, re-run `scripts/setup-base-stack.sh`, then
+  `docker compose restart nginx` (see "Reaching the stack from another
+  machine"). Note that trusting the CA alone does **not** fix this, and that
+  `curl -k` hides it entirely.
+- **Context window smaller than configured** — llama-server reads
+  `LLAMA_ARG_CTX_SIZE`, not `LLAMA_ARG_CONTEXT_SIZE`; an unrecognised
+  `LLAMA_ARG_*` name is ignored silently and you fall back to the 4096 default.
+  Confirm what a loaded model actually got with
+  `docker compose logs llama-1 | grep n_ctx_slot`.
 - **Permission errors on writes** — the stack runs as `1000:1000`; make sure
   `var/` (and the sockets dir) are owned by that user (re-run the relevant
   `scripts/setup-*-stack.sh` as root on Linux).

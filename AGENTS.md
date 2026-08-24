@@ -90,7 +90,7 @@ with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
 - **Never set `background_health_checks: true`.** LiteLLM implements it by
   sending a real completion to every model, which under router mode loads every
   GGUF into VRAM on a timer.
-- **Keep generator `MAX_PARALLEL` equal to `LLAMA_ARG_PARALLEL`.**
+- **Keep generator `MAX_PARALLEL` equal to `LLAMA_N_PARALLEL`.**
 - **One `api_base` per GGUF.** Do not add a second deployment for the same
   `model_name` — that would load the same weights on both servers.
 - Generated deployments set `use_chat_completions_api: true` and drop

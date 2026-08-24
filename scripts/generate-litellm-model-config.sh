@@ -7,7 +7,13 @@ ROUTING_FILE="${ROUTING_FILE:-$MODELS_DIR/model-routing.tsv}"
 ROUTING_LABEL="${ROUTING_LABEL:-$ROUTING_FILE}"
 OUT="${OUT:-$REPO_ROOT/var/run/litellm/models.generated.yaml}"
 ROUTER_PORT="${ROUTER_PORT:-8080}"
-MAX_PARALLEL="${MAX_PARALLEL:-2}"
+# Default the per-deployment cap to the router's own slot count so the two
+# cannot drift. This script is not run by docker compose, so .env is read
+# directly; an explicit MAX_PARALLEL= still wins.
+if [ -z "${MAX_PARALLEL:-}" ] && [ -z "${LLAMA_N_PARALLEL:-}" ] && [ -f "$REPO_ROOT/.env" ]; then
+    LLAMA_N_PARALLEL=$(sed -n 's|^LLAMA_N_PARALLEL=\(.\{1,\}\)$|\1|p' "$REPO_ROOT/.env" | head -1)
+fi
+MAX_PARALLEL="${MAX_PARALLEL:-${LLAMA_N_PARALLEL:-2}}"
 MAX_MODELS="${MAX_MODELS:-4}"
 MAX_PER_ROUTER="${MAX_PER_ROUTER:-2}"
 
@@ -15,7 +21,7 @@ case "${1:-}" in
     "") ;;
     -h|--help)
         echo "usage: $0"
-        echo "Environment: MODELS_DIR ROUTING_FILE OUT MAX_PARALLEL"
+        echo "Environment: MODELS_DIR ROUTING_FILE OUT MAX_PARALLEL LLAMA_N_PARALLEL"
         exit 0
         ;;
     *)
