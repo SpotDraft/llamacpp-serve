@@ -335,9 +335,20 @@ To reach the box as, say, `dgx.example.com`, set this in `.env`:
 
 ```sh
 CERT_HOSTNAME=dgx.example.com
-# optional extras, comma-separated, each DNS:- or IP:-prefixed
-CERT_EXTRA_SANS=IP:100.64.0.1, DNS:dgx.internal
 ```
+
+Both settings take a comma-separated list, so several names are fine:
+
+```sh
+CERT_HOSTNAME=dgx.example.com, dgx.internal, 100.64.0.1
+CERT_EXTRA_SANS=IP:100.64.0.1, DNS:another.example.com
+```
+
+An entry may carry an explicit `DNS:` or `IP:` prefix; without one, hostnames,
+IPv4 and IPv6 literals are classified automatically. An entry containing a
+space or other invalid character is rejected with an error rather than being
+split into several bogus names, and a failed issuance leaves the existing key
+and certificate untouched.
 
 then reissue and restart nginx:
 

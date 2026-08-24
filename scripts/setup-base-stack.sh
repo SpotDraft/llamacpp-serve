@@ -31,8 +31,41 @@ CERT_HOSTNAME=$(env_or_dotenv CERT_HOSTNAME)
 CERT_EXTRA_SANS=$(env_or_dotenv CERT_EXTRA_SANS)
 
 CERT_SANS="DNS:localhost, DNS:host.docker.internal, IP:127.0.0.1"
-[ -n "$CERT_HOSTNAME" ] && CERT_SANS="$CERT_SANS, DNS:$CERT_HOSTNAME"
-[ -n "$CERT_EXTRA_SANS" ] && CERT_SANS="$CERT_SANS, $CERT_EXTRA_SANS"
+
+# Both settings take a comma-separated list. An entry may carry an explicit
+# DNS: or IP: prefix; without one it is classified here, so a plain list of
+# hostnames is all most operators need to write.
+append_sans() {
+    [ -n "$1" ] || return 0
+    _oifs=$IFS
+    IFS=','
+    # Split on commas only. Word-splitting on whitespace would turn a typo
+    # like "my host.example.com" into two SAN entries instead of an error.
+    for _e in $1; do
+        IFS=$_oifs
+        _e=$(printf '%s' "$_e" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        if [ -n "$_e" ]; then
+            case "$_e" in
+                *[!A-Za-z0-9.:*_-]*)
+                    echo "error: invalid character in certificate name: '$_e'" >&2
+                    echo "error: check CERT_HOSTNAME / CERT_EXTRA_SANS in .env." >&2
+                    exit 1
+                    ;;
+            esac
+            case "$_e" in
+                DNS:*|IP:*) ;;
+                *:*)        _e="IP:$_e" ;;   # IPv6 literal
+                *[!0-9.]*)  _e="DNS:$_e" ;;  # hostname
+                *)          _e="IP:$_e" ;;   # IPv4 literal
+            esac
+            CERT_SANS="$CERT_SANS, $_e"
+        fi
+        IFS=','
+    done
+    IFS=$_oifs
+}
+append_sans "$CERT_HOSTNAME"
+append_sans "$CERT_EXTRA_SANS"
 REISSUED=0
 CA_NEW=0
 
@@ -41,14 +74,17 @@ CA_NEW=0
 # for a cert that predates a newly added SAN, so the new name never gets issued.
 cert_is_stale() {
     [ -f nginx/certs/server.crt ] || return 0
-    _live=$(openssl x509 -in nginx/certs/server.crt -noout -ext subjectAltName 2>/dev/null) || return 0
-    # openssl prints "IP Address:1.2.3.4" where CERT_SANS says "IP:1.2.3.4".
-    _live=$(printf '%s\n' "$_live" | sed 's/IP Address:/IP:/g' | tr ',' '\n' \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '^(DNS|IP):')
+    # Ask openssl whether the cert matches each name, rather than string-diffing
+    # the SAN list: it applies the real matching rules and normalises IPv6, so
+    # "IP:::1" is recognised in the cert's "IP Address:0:0:0:0:0:0:0:1" form.
     for _san in $(printf '%s\n' "$CERT_SANS" | tr ',' '\n' \
                   | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'); do
-        [ -n "$_san" ] || continue
-        printf '%s\n' "$_live" | grep -qxF -- "$_san" || return 0
+        case "$_san" in
+            DNS:*) openssl x509 -in nginx/certs/server.crt -noout \
+                     -checkhost "${_san#DNS:}" >/dev/null 2>&1 || return 0 ;;
+            IP:*)  openssl x509 -in nginx/certs/server.crt -noout \
+                     -checkip "${_san#IP:}" >/dev/null 2>&1 || return 0 ;;
+        esac
     done
     return 1
 }
@@ -95,18 +131,32 @@ if [ ! -f nginx/certs/server.key ] || [ ! -f nginx/certs/server.crt ] \
     fi
     rm -f nginx/certs/server.csr
 
+    # Issue into .new and only commit on success. Writing server.key in place
+    # first would leave a regenerated key beside the old certificate if
+    # signing then failed -- a mismatch that stops nginx from starting.
     echo "Generating server key and CSR..."
-    openssl req -newkey rsa:4096 -nodes -keyout nginx/certs/server.key \
+    openssl req -newkey rsa:4096 -nodes -keyout nginx/certs/server.key.new \
       -out nginx/certs/server.csr -subj "/CN=localhost" 2>/dev/null
 
     echo "Signing server certificate..."
-    openssl x509 -req -in nginx/certs/server.csr \
+    if ! openssl x509 -req -in nginx/certs/server.csr \
       -CA nginx/certs/ca.crt -CAkey nginx/certs/ca.key \
-      -CAcreateserial -out nginx/certs/server.crt -days 3650 \
+      -CAcreateserial -out nginx/certs/server.crt.new -days 3650 \
       -extensions v3_req -extfile /dev/stdin <<EOF
 [ v3_req ]
 subjectAltName = $CERT_SANS
 EOF
+    then
+        rm -f nginx/certs/server.key.new nginx/certs/server.crt.new \
+              nginx/certs/server.csr
+        echo "error: could not issue a certificate for: $CERT_SANS" >&2
+        echo "error: check CERT_HOSTNAME / CERT_EXTRA_SANS in .env." >&2
+        echo "error: the existing key and certificate were left untouched." >&2
+        exit 1
+    fi
+    mv nginx/certs/server.key.new nginx/certs/server.key
+    mv nginx/certs/server.crt.new nginx/certs/server.crt
+    rm -f nginx/certs/server.csr
     echo "Server certificate issued for: $CERT_SANS"
 else
     echo "Server certificate is current."
