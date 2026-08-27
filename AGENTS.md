@@ -40,6 +40,7 @@ docker compose logs litellm | tail -50
 cat var/run/litellm/models.generated.yaml
 KEY=$(grep '^LITELLM_MASTER_KEY=' .env | cut -d= -f2)
 curl -k -H "Authorization: Bearer $KEY" https://localhost:11437/v1/models
+curl -k -H "Authorization: Bearer $KEY" https://localhost:11437/cache/ping
 curl -sk --max-time 3 -o /dev/null -w '%{http_code}\n' https://localhost:11438/
 ```
 
@@ -102,8 +103,13 @@ with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
   in the UI for a model the generator already pinned.
 - `litellm` is the one service **not** pinned to `1000:1000` — see the comment
   in `docker-compose.litellm.yml` before "fixing" it.
-- **The overlay splits the flat `llama` network into four segments**
-  (`frontend` / `llama` / `backend` / `db`; the last two are `internal`).
+- **Redis response caching is exact-match and enabled by default** for
+  chat/completion and Responses calls, with a one-hour TTL. Redis is
+  authenticated, AOF-backed, memory-capped, and reachable only by LiteLLM.
+  Preserve per-request `no-cache` and `no-store` controls when changing it.
+- **The overlay splits the flat `llama` network into five segments**
+  (`frontend` / `llama` / `backend` / `db` / `cache`; the last three are
+  `internal`).
   `litellm` is the only service spanning them. Do not put `webui` or `nginx`
   back on the routers' network: `llama-server` has no auth, so a shared
   network makes the whole gateway bypassable. The webui reaches the API over
@@ -116,7 +122,7 @@ with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
   error into a no-deployments error. `allowed_fails`/`cooldown_time` cover the
   accounting side.
 - **Supporting images are digest-pinned** (`litellm`, `nginx`, `postgres`,
-  `alpine/socat`). llama.cpp intentionally is not. Re-resolve with
+  `redis`, `alpine/socat`). llama.cpp intentionally is not. Re-resolve with
   `docker buildx imagetools inspect <ref>` and keep the readable tag in front
   of the `@sha256:`.
 - `LITELLM_DB_PASSWORD` gates the bundled Postgres and is interpolated into
@@ -124,7 +130,8 @@ with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
   volumes keep working — Postgres only honours `POSTGRES_PASSWORD` on an empty
   volume. Never hand an existing volume a fresh random password.
 - Version is pinned (`ghcr.io/berriai/litellm:v1.97.0`). Bump deliberately.
-- Postgres is bundled in `docker-compose.litellm.yml` (no host port).
+- Postgres and Redis are bundled in `docker-compose.litellm.yml` (no host
+  ports).
 
 ## Never commit
 
@@ -133,8 +140,9 @@ the following, so keep it that way:
 
 - `var/` — runtime data (model files, SQLite DB, sockets, generated configs) and
   user chat data.
-- `.env` — `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY` and the Admin UI password.
-  Update `.env.example` instead when adding a setting.
+- `.env` — `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, database/cache passwords
+  and the Admin UI password. Update `.env.example` instead when adding a
+  setting.
 - `nginx/certs/` — private CA keys and certificates.
 - Any `*.key`, `*.crt`, `*.pem`, `*.csr`, `*.sock`, `*.log`.
 

@@ -4,7 +4,7 @@ nginx/certs/
 *.sock
 *.log
 
-# Secrets: Postgres DSN, LiteLLM master/salt keys, UI password
+# Secrets: Postgres/Redis credentials, LiteLLM master/salt keys, UI password
 .env
 
 # CA Certificates
