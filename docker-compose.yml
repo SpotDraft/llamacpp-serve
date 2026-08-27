@@ -1,6 +1,15 @@
 name: llamacpp-serve
 
+# DGX Spark stack: two CUDA llama-server routers + Open WebUI, TLS via nginx.
+# LiteLLM (auth, rate limits, pinning) is the other compose file:
+#   docker compose -f docker-compose.yml -f docker-compose.litellm.yml up -d
+
 x-llama-base: &llama-base
+  # Deliberately NOT digest-pinned: this is the inference engine and the point
+  # of the rolling tag is to pick up llama.cpp/CUDA fixes. The supporting
+  # images (nginx, socat, postgres, litellm) are pinned instead. Pin this too
+  # if you need byte-identical rebuilds:
+  #   docker buildx imagetools inspect ghcr.io/ggml-org/llama.cpp:server-cuda
   image: ghcr.io/ggml-org/llama.cpp:server-cuda
   restart: unless-stopped
   # Run as the host user so files created are not root-owned.
@@ -21,19 +30,30 @@ x-llama-base: &llama-base
             capabilities:
               - gpu
   # llama-server config via its LLAMA_ARG_* env vars.
-  # Router mode (no LLAMA_ARG_MODEL): every .gguf dropped into var/lib/llama/
-  # (mounted /models) is discovered at startup. A model loads into its own
-  # child llama-server process on first request and is LRU-evicted when
-  # --models-max is reached. All settings below are inherited by the children.
+  # Router mode (no LLAMA_ARG_MODEL): every standalone .gguf in var/lib/llama/
+  # (mounted /models) is discovered at startup and advertised on /v1/models.
+  #
+  # LLAMA_ARG_MODELS_MAX=2 bounds how many models are *resident* per router,
+  # not how many are discovered: drop in a fifth GGUF and both routers will
+  # still serve all five, LRU-evicting to keep two loaded each. That is a
+  # supported default-stack configuration, it just trades VRAM churn for
+  # breadth.
+  #
+  # The LiteLLM path pins each model to exactly one api_base using
+  # scripts/apply-model-routing.sh, with at most two models on each router.
+  # This file does not cap how many GGUFs the default stack discovers.
   environment:
     LLAMA_ARG_HOST: 0.0.0.0
     LLAMA_ARG_PORT: "8080"
     LLAMA_ARG_MODELS_DIR: /models
-    LLAMA_ARG_MODELS_MAX: "4"
-    LLAMA_ARG_CONTEXT_SIZE: "16384"
-    LLAMA_ARG_N_GPU_LAYERS: "999"
-    LLAMA_ARG_PARALLEL: "2"
-    LLAMA_ARG_FLASH_ATTN: "on"
+    # Upstream names are exact: llama-server reads LLAMA_ARG_CTX_SIZE and
+    # LLAMA_ARG_N_PARALLEL. LLAMA_ARG_CONTEXT_SIZE / LLAMA_ARG_PARALLEL are
+    # silently ignored -- verify any new one against `llama-server --help`.
+    LLAMA_ARG_MODELS_MAX: "${LLAMA_MODELS_MAX:-2}"
+    LLAMA_ARG_CTX_SIZE: "${LLAMA_CTX_SIZE:-32768}"
+    LLAMA_ARG_N_GPU_LAYERS: "${LLAMA_N_GPU_LAYERS:-999}"
+    LLAMA_ARG_N_PARALLEL: "${LLAMA_N_PARALLEL:-2}"
+    LLAMA_ARG_FLASH_ATTN: "${LLAMA_FLASH_ATTN:-on}"
     # CUDA compute cache and any other writes go to this writable HOME.
     HOME: /root
   # Models are read-only; a separate writable dir covers /root so the
@@ -50,7 +70,11 @@ x-llama-base: &llama-base
       max-file: "100"
 
 x-socat-base: &socat-base
-  image: alpine/socat:latest
+  # Pinned by multi-arch index digest: this bridge sits between nginx and every
+  # backend, so a registry retag must not be able to swap it out on restart.
+  # Bump deliberately with:
+  #   docker buildx imagetools inspect alpine/socat:latest
+  image: alpine/socat:latest@sha256:3ed1cd38741bd445ebffa3aecb9d80c46a83db45f5b5ef03332976c7ca9814af
   restart: unless-stopped
   user: "1000:1000"
   # Harden: no new privileges, drop all capabilities.
@@ -62,8 +86,6 @@ x-socat-base: &socat-base
     - ./var/run/sockets:/sockets
   networks:
     - llama
-  depends_on:
-    - llama-1
   logging:
     driver: "json-file"
     options:
@@ -102,13 +124,15 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Point at the nginx pool over TLS. 172.31.0.1 is the pinned bridge
-    # gateway -> the host, where nginx (host network) listens on 11437.
+    extra_hosts:
+      # Published nginx ports on the DGX host (host-gateway).
+      - "host.docker.internal:host-gateway"
     environment:
-      OPENAI_API_BASE_URL: https://172.31.0.1:11437/v1
+      OPENAI_API_BASE_URL: https://host.docker.internal:11437/v1
       # Public URL of this webui as seen by browsers (via nginx :11438).
       WEBUI_URL: https://localhost:11438
       # llama-server has no auth; open-webui needs a non-empty placeholder.
+      # The LiteLLM compose file overrides this with LITELLM_WEBUI_KEY.
       OPENAI_API_KEY: none
       # Disable the bundled Ollama backend - llama.cpp is the only engine.
       ENABLE_OLLAMA_API: "false"
@@ -134,7 +158,7 @@ services:
         max-file: "100"
 
   socat-webui:
-    image: alpine/socat:latest
+    image: alpine/socat:latest@sha256:3ed1cd38741bd445ebffa3aecb9d80c46a83db45f5b5ef03332976c7ca9814af
     restart: unless-stopped
     user: "1000:1000"
     # Harden: no new privileges, drop all capabilities.
@@ -156,7 +180,9 @@ services:
         max-file: "100"
 
   nginx:
-    image: nginx:latest
+    # Pinned by multi-arch index digest; bump deliberately with:
+    #   docker buildx imagetools inspect nginx:latest
+    image: nginx:latest@sha256:8f029c543423e3eac6b08254718bc31eb75633b1e448026b6616927baa7d4bfe
     restart: unless-stopped
     # Run as non-root.
     user: "1000:1000"
@@ -166,15 +192,17 @@ services:
       sh -c "/healthcheck.sh --init &&
              (/healthcheck.sh --watch &) &&
              exec /docker-entrypoint.sh nginx -g 'daemon off;'"
-    # Host networking so nginx listens on the host's :11437/:11438 and the
-    # webui can reach the pool via the pinned bridge gateway (172.31.0.1).
-    network_mode: host
+    ports:
+      - "11437:11437"
+      - "11438:11438"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/healthcheck.sh:/healthcheck.sh:ro
       - ./nginx/certs:/etc/nginx/certs:ro
       - ./var/run/sockets:/sockets:ro
       - ./var/run/nginx:/etc/nginx/runtime
+    networks:
+      - llama
     depends_on:
       - socat-1
       - socat-2
@@ -187,9 +215,3 @@ services:
 
 networks:
   llama:
-    # Pin a subnet so the bridge gateway (172.31.0.1) is deterministic.
-    # The webui uses this IP to reach nginx (host network) over TLS, and
-    # the server cert has it in its SANs.
-    ipam:
-      config:
-        - subnet: 172.31.0.0/24

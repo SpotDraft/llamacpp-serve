@@ -9,19 +9,45 @@ the full architecture, setup, configuration knobs, and troubleshooting. Read it
 before working here. This file only adds the operational details agents need
 that the README does not cover.
 
+## Target host
+
+This stack is for an **NVIDIA DGX Spark / GB10**. CUDA image + CDI
+(`nvidia.com/gpu=all`). Two `llama-server` routers, two resident models per
+router (`LLAMA_ARG_MODELS_MAX=2`), context **32768**. LiteLLM supports at most
+four standalone GGUFs, explicitly assigned with
+`scripts/apply-model-routing.sh`.
+
 ## Verification commands
 
 There is no test suite and no linter. Verification = validating the Compose
 file, the nginx config, and the rendered diagrams:
 
 ```sh
-docker compose config                 # lint the compose file (main check)
+docker compose config                 # lint the default compose file (main check)
 docker compose exec nginx nginx -t    # lint nginx config inside the container
 docker compose exec nginx cat /etc/nginx/runtime/upstream.conf  # healthy routers
-ls var/run/sockets                  # sockets must exist (llama-1.sock, llama-2.sock, webui.sock)
+ls var/run/sockets                    # sockets: llama-1.sock, llama-2.sock, webui.sock
 docker compose logs llama-1 llama-2 | grep -iE 'router|models-dir'  # router mode active
 curl -k https://localhost:11437/v1/models  # smoke test the pool (needs a model)
 ```
+
+With LiteLLM, also:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.litellm.yml config
+ls var/run/sockets                    # plus litellm.sock
+docker compose logs litellm | tail -50
+cat var/run/litellm/models.generated.yaml
+KEY=$(grep '^LITELLM_MASTER_KEY=' .env | cut -d= -f2)
+curl -k -H "Authorization: Bearer $KEY" https://localhost:11437/v1/models
+curl -sk --max-time 3 -o /dev/null -w '%{http_code}\n' https://localhost:11438/
+```
+
+`docker compose config` for the *default* stack does not need `.env`. Run
+`scripts/setup-base-stack.sh` for that stack. The LiteLLM overlay interpolates
+secrets from `.env`; run `scripts/setup-litellm-stack.sh` before enabling it.
+Both setup scripts are idempotent. The LiteLLM setup invokes the base setup,
+creates/migrates `.env`, and interactively configures model placement.
 
 After changing behavior, start the stack (`docker compose up --build -d`) and run
 the smoke tests from the README.
@@ -30,27 +56,85 @@ the smoke tests from the README.
 
 - Both `llama-server` instances run in **router mode** (no `LLAMA_ARG_MODEL`):
   models are discovered from `var/lib/llama` at startup and served on demand.
-- **Adding a model is a zero-config change** (no compose edit): drop a `.gguf`
-  into `var/lib/llama/` then `docker compose restart llama-1 llama-2`. The
-  model ID is the filename without the `.gguf` extension. Discovery happens at
-  startup only — the running server has no live rescan endpoint.
-- Models load into their own child `llama-server` process on first request and
-  are LRU-evicted per router when `LLAMA_ARG_MODELS_MAX` is reached. Two routers
-  means up to `2 x MODELS_MAX` models can be resident across the pool (each
-  router evicts independently) — total is bounded by GPU memory.
-- Two routers are kept for redundancy: the nginx health checker drops a
-  restarting router from the pool, the other keeps serving, and its models
-  reload on demand. With round-robin balancing, a model can be hot on both
-  routers simultaneously — that temporarily doubles VRAM for that model.
+- **At most 4 standalone `.gguf` files with LiteLLM — two per router.**
+  `scripts/apply-model-routing.sh` asks where each model belongs and persists
+  the assignment in `var/lib/llama/model-routing.tsv`. The default stack
+  enforces no discovery limit: `LLAMA_ARG_MODELS_MAX=2` caps only resident
+  models, so additional GGUFs are served with LRU eviction.
+- **GGUF filenames must be valid model IDs** (`[A-Za-z0-9._+-]`, no leading
+  `-`). `scripts/generate-litellm-model-config.sh` rejects anything else.
+- **Adding a model:** drop a `.gguf` into `var/lib/llama/` then
+  `scripts/apply-model-routing.sh`. It prompts for instance 1 or 2, regenerates
+  the LiteLLM config, then restarts in place. The model ID is the filename
+  without `.gguf`.
+- Each router holds up to two resident GGUFs. LiteLLM emits **one `api_base`
+  per model**, so a request never load-balances onto the neighbour. Placement
+  balances model residency, not request volume.
 - Sharded/multi-file GGUFs are not auto-discovered; they need a presets INI
   (`LLAMA_ARG_MODELS_PRESET`) pointing at the first shard.
+
+## Optional LiteLLM compose file
+
+LiteLLM is **opt-in**. Do not put `litellm` in `docker-compose.yml`. Enable it
+with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
+
+- Default `:11437` goes to `llama_pool`. With LiteLLM, nginx mounts
+  `nginx/nginx.litellm.conf` so `:11437` is LiteLLM and `:11438` is Open WebUI.
+  llama.cpp is not on a host port.
+- **`litellm/config.yaml` is hand-written; the `model_list` is not.** It lives
+  in `var/run/litellm/models.generated.yaml`, generated by
+  `scripts/generate-litellm-model-config.sh` and pulled in via `include:`.
+  Never edit the generated file — use `scripts/apply-model-routing.sh`.
+- `include:` paths resolve **relative to `config.yaml`**, which is why both
+  files are mounted into `/app/config/` in the container.
+- **Never set `background_health_checks: true`.** LiteLLM implements it by
+  sending a real completion to every model, which under router mode loads every
+  GGUF into VRAM on a timer.
+- **Keep generator `MAX_PARALLEL` equal to `LLAMA_N_PARALLEL`.**
+- **One `api_base` per GGUF.** Do not add a second deployment for the same
+  `model_name` — that would load the same weights on both servers.
+- Generated deployments set `use_chat_completions_api: true` and drop
+  `previous_response_id`. Do not remove those flags: llama.cpp rejects the
+  param, and Responses conversation continuation is unavailable even though
+  stock OpenAI clients can connect unmodified.
+- `STORE_MODEL_IN_DB=True` is the default so the Admin UI can add/edit models.
+  The GGUF pin map is still generated from disk; do not add a second `api_base`
+  in the UI for a model the generator already pinned.
+- `litellm` is the one service **not** pinned to `1000:1000` — see the comment
+  in `docker-compose.litellm.yml` before "fixing" it.
+- **The overlay splits the flat `llama` network into four segments**
+  (`frontend` / `llama` / `backend` / `db`; the last two are `internal`).
+  `litellm` is the only service spanning them. Do not put `webui` or `nginx`
+  back on the routers' network: `llama-server` has no auth, so a shared
+  network makes the whole gateway bypassable. The webui reaches the API over
+  TLS via `host.docker.internal:11437`, exactly like an external client.
+- **No nginx health watcher in overlay mode, by design.** `healthcheck.sh`
+  exists to prune the `llama_pool` upstream, and `nginx.litellm.conf` has no
+  such upstream — nginx only proxies `litellm.sock` and `webui.sock`. LiteLLM
+  owns routing, and each model has exactly one deployment, so there is no
+  second target to fail over to; removing a dead router would turn an upstream
+  error into a no-deployments error. `allowed_fails`/`cooldown_time` cover the
+  accounting side.
+- **Supporting images are digest-pinned** (`litellm`, `nginx`, `postgres`,
+  `alpine/socat`). llama.cpp intentionally is not. Re-resolve with
+  `docker buildx imagetools inspect <ref>` and keep the readable tag in front
+  of the `@sha256:`.
+- `LITELLM_DB_PASSWORD` gates the bundled Postgres and is interpolated into
+  `DATABASE_URL`. It falls back to `litellm` so pre-existing `postgres-data`
+  volumes keep working — Postgres only honours `POSTGRES_PASSWORD` on an empty
+  volume. Never hand an existing volume a fresh random password.
+- Version is pinned (`ghcr.io/berriai/litellm:v1.97.0`). Bump deliberately.
+- Postgres is bundled in `docker-compose.litellm.yml` (no host port).
 
 ## Never commit
 
 The README's security notes cover why secrets stay local; `.gitignore` excludes
 the following, so keep it that way:
 
-- `var/` — runtime data (model files, SQLite DB, sockets) and user chat data.
+- `var/` — runtime data (model files, SQLite DB, sockets, generated configs) and
+  user chat data.
+- `.env` — `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY` and the Admin UI password.
+  Update `.env.example` instead when adding a setting.
 - `nginx/certs/` — private CA keys and certificates.
 - Any `*.key`, `*.crt`, `*.pem`, `*.csr`, `*.sock`, `*.log`.
 
@@ -71,3 +155,6 @@ docker run --rm --user 1000:1000 \
 
 Note: the mermaid-cli image runs as uid 1001 by default; the `--user 1000:1000`
 flag is required so it can write into the bind-mounted `docs/` tree.
+
+LiteLLM variants: `architecture-litellm`, `request-flow-litellm`,
+`webui-flow-litellm`.
