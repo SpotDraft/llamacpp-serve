@@ -31,6 +31,24 @@ litellm_settings:
   # additional_drop_params (see generate-litellm-model-config.sh).
   drop_params: true
 
+  # Cache exact-match chat/completion and Responses API results in the bundled
+  # Redis service. The one-hour TTL bounds staleness, while Redis itself also
+  # has an LRU memory cap. Clients can force a fresh response with
+  # `"cache": {"no-cache": true}` or prevent storage with `no-store`.
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    password: os.environ/LITELLM_REDIS_PASSWORD
+    namespace: llamacpp-serve
+    ttl: 3600
+    supported_call_types:
+      - completion
+      - acompletion
+      - responses
+      - aresponses
+
   # A cold model has to load its weights into VRAM before it emits a token, so
   # the first request to a model is slow. Matches nginx's proxy_read_timeout.
   # (LiteLLM's own default is 6000s, which is far too permissive.)

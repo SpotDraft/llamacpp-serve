@@ -38,6 +38,7 @@ if [ ! -f .env ]; then
     MASTER_KEY="sk-$(openssl rand -hex 24)"
     SALT_KEY="$(openssl rand -hex 24)"
     UI_PASSWORD="$(openssl rand -hex 12)"
+    REDIS_PASSWORD="$(openssl rand -hex 24)"
     if postgres_volume_exists; then
         DB_PASSWORD="litellm"
         echo "Existing postgres-data volume found; using its historical default password."
@@ -52,6 +53,7 @@ if [ ! -f .env ]; then
       -e "s|^UI_PASSWORD=.*|UI_PASSWORD=$UI_PASSWORD|" \
       -e "s|^LITELLM_WEBUI_KEY=.*|LITELLM_WEBUI_KEY=$MASTER_KEY|" \
       -e "s|^LITELLM_DB_PASSWORD=.*|LITELLM_DB_PASSWORD=$DB_PASSWORD|" \
+      -e "s|^LITELLM_REDIS_PASSWORD=.*|LITELLM_REDIS_PASSWORD=$REDIS_PASSWORD|" \
       .env.example > .env
     chmod 600 .env
     echo ".env created with generated LiteLLM secrets."
@@ -67,6 +69,8 @@ else
     ensure_env LITELLM_WEBUI_KEY "$EXISTING_MASTER"
     ensure_env STORE_MODEL_IN_DB "True"
     ensure_env LITELLM_DB_PASSWORD "litellm"
+    ensure_env LITELLM_REDIS_PASSWORD "$(openssl rand -hex 24)"
+    ensure_env LITELLM_REDIS_MAXMEMORY "1gb"
     chmod 600 .env
 
     if [ "$MIGRATED" -eq 1 ]; then

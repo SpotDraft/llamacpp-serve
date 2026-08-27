@@ -11,7 +11,7 @@ flowchart TD
 
         subgraph NET["bridge network llama"]
             SL["socat-litellm<br/>litellm.sock"]
-            LL["<b>litellm</b> :4000<br/>auth - rate limits - pinning"]
+            LL["<b>litellm</b> :4000<br/>auth - limits - cache - pinning"]
             subgraph POOL["llama.cpp - 4 GGUFs max, not published"]
                 L1["llama-1<br/>up to 2 assigned models"]
                 L2["llama-2<br/>up to 2 assigned models"]
@@ -25,6 +25,7 @@ flowchart TD
         GEN["models.generated.yaml"]
         DATA["var/lib/webui"]
         PG[("bundled Postgres")]
+        REDIS[("bundled Redis<br/>response cache")]
     end
 
     CLI1 -->|TLS| LS11437
@@ -36,6 +37,7 @@ flowchart TD
     LL -->|"pinned GGUFs A/B"| L1
     LL -->|"pinned GGUFs C/D"| L2
     LL --> PG
+    LL --> REDIS
 
     LS11438 -.->|webui.sock| SW
     SW -->|TCP :8080| W
