@@ -50,8 +50,8 @@ default and `docker compose up` does not start it.
 - **Request correlation** — nginx honours or mints an `X-Request-ID`, forwards
   it upstream, echoes it back, and logs it as `rid=`.
 - **Optional LiteLLM gateway** — auth, per-key RPM/TPM/budgets, concurrency
-  caps, spend logs and OpenTelemetry, with each GGUF pinned to one router.
-  No changes to the llama.cpp routers.
+  caps, spend logs, OpenTelemetry and Redis-backed response caching, with each
+  GGUF pinned to one router. No changes to the llama.cpp routers.
 
 ## Architecture
 
@@ -112,7 +112,7 @@ has no `llama_pool` at all: LiteLLM does the routing and the watcher is not run.
 
 ```
 ├── docker-compose.yml           # Default stack (llama.cpp + webui + nginx)
-├── docker-compose.litellm.yml   # Overlay: LiteLLM on :11437 + bundled Postgres
+├── docker-compose.litellm.yml   # Overlay: LiteLLM + bundled Postgres and Redis
 ├── .env.example                 # Template for .env (LiteLLM secrets, gitignored)
 ├── litellm/
 │   └── config.yaml              # Gateway settings (used only with LiteLLM)
@@ -197,8 +197,8 @@ Open WebUI at <https://localhost:11438> and create its first admin account.
 <summary>Six steps — setup, enable the overlay, place models, start, verify</summary>
 
 1. Create the base runtime, TLS certificates, `.env`, generated secrets and the
-   LiteLLM runtime. **Run this before copying any GGUF into the model store**
-   (see step 3):
+   LiteLLM runtime. This includes separate Postgres and Redis passwords. **Run
+   this before copying any GGUF into the model store** (see step 3):
 
 ```sh
 scripts/setup-litellm-stack.sh --auto --yes
@@ -272,6 +272,11 @@ first login; the generated master key should be used only for administration.
 - **LiteLLM stack:** after adding or removing a GGUF, run
   `scripts/apply-model-routing.sh`. It updates placement and restarts the
   routers and LiteLLM in place.
+- **Upgrading an existing LiteLLM overlay** (for example after pulling Redis
+  support): run `scripts/setup-litellm-stack.sh --auto --yes` *before* the first
+  `docker compose up`. The overlay requires `LITELLM_REDIS_PASSWORD` in `.env`
+  during Compose parsing; the setup script generates or migrates it idempotently
+  and replaces any `CHANGE-ME` placeholder left from `.env.example`.
 - Inspect status with `docker compose ps` and logs with
   `docker compose logs -f`.
 - Stop and remove containers with `docker compose down`. Runtime data, models
@@ -434,19 +439,32 @@ LiteLLM on `:11437`.
 <details>
 <summary><b>How the gateway path works</b> — request flow, Postgres, Responses API limits</summary>
 
-Postgres is **bundled** (no host port). LiteLLM keeps virtual keys, teams,
-budgets, rate-limit counters and spend logs there, and migrates its own schema
-on startup. To use a remote database instead, change `DATABASE_URL` on the
-`litellm` service in `docker-compose.litellm.yml`.
+Postgres and Redis are **bundled** with no host ports. LiteLLM keeps virtual
+keys, teams, budgets, rate-limit counters and spend logs in Postgres, and
+migrates its own schema on startup. Redis holds exact-match model responses for
+one hour, persists them across container restarts with AOF, and evicts
+least-recently-used entries at its memory limit. To use remote services instead,
+change `DATABASE_URL` and the cache settings on the `litellm` service.
 
 ![LiteLLM request flow](docs/diagrams/request-flow-litellm.svg)
 
 A client calls `https://localhost:11437/v1` with a virtual key. nginx terminates
 TLS and forwards to LiteLLM over `litellm.sock`. LiteLLM authenticates the key,
 applies RPM/TPM/budget and concurrency caps (queueing overflow instead of
-hitting the GPU), sends the request to that model's **pinned** router
-(one `api_base` per GGUF), streams the response, then writes a spend log and an
-OpenTelemetry span.
+hitting the GPU), and checks Redis for an identical request. A hit bypasses the
+GPU. On a miss, LiteLLM sends the request to that model's **pinned** router
+(one `api_base` per GGUF), streams the response, caches it, then writes a spend
+log and an OpenTelemetry span.
+
+Caching is on by default for chat/completion and Responses calls. Add
+`"cache": {"no-cache": true}` to force a fresh response, or
+`"cache": {"no-store": true}` to keep a response out of Redis. These controls
+are LiteLLM request fields and do not need changes to llama.cpp.
+
+`overwrite_user_with_key_hash: true` in `litellm/config.yaml` stamps each
+request with the authenticated virtual key (or the master-key alias) as the
+OpenAI `user` field. Exact-match cache keys include `user`, so different
+virtual keys cannot reuse one another's cached responses.
 
 Stock OpenAI clients can connect unmodified (`/v1/chat/completions`,
 `/v1/models`). That is not full Responses compatibility. Each generated
@@ -597,11 +615,15 @@ and is not wired up here; the OTEL exporter covers the same ground for free.
 | `callbacks` (off by default)        | `litellm/config.yaml`   | Uncomment `["otel"]` when a collector is running    |
 | `store_model_in_db: true`           | `litellm/config.yaml`   | Persists models in Postgres so the Admin UI can add/edit them |
 | `background_health_checks: false`   | `litellm/config.yaml`   | **Leave off** — it would load every GGUF on a timer |
+| `cache_params.ttl: 3600`            | `litellm/config.yaml`   | Exact-match response cache lifetime in seconds |
+| `overwrite_user_with_key_hash: true`| `litellm/config.yaml`   | Isolates cache entries per authenticated virtual key |
+| `LITELLM_REDIS_MAXMEMORY=1gb`       | `.env`                  | Redis memory ceiling; entries use LRU eviction |
 | `MAX_PARALLEL` (default 2)          | model config generator | Per-deployment concurrency; defaults to `LLAMA_N_PARALLEL` |
 | `use_chat_completions_api: true`    | generated per model     | Bridges `/v1/responses` to llama.cpp `/chat/completions` |
 | `additional_drop_params`            | generated per model     | Drops `previous_response_id` (llama.cpp rejects it) |
 | `model-routing.tsv`                 | `var/lib/llama/`        | Persistent model-to-router assignments; not written by `--auto` |
 | `LITELLM_MASTER_KEY` / `LITELLM_SALT_KEY` | `.env`            | Admin credential / credential encryption key  |
+| `LITELLM_REDIS_PASSWORD`            | `.env`                  | Password for the bundled internal Redis cache |
 | `UI_USERNAME` / `UI_PASSWORD`       | `.env`                  | Admin UI login                                |
 | `LITELLM_WEBUI_KEY`                 | `.env`                  | Virtual key Open WebUI authenticates with     |
 | `OTEL_EXPORTER` / `OTEL_ENDPOINT` / `OTEL_HEADERS` | `.env`   | Where traces are exported                     |
@@ -684,6 +706,17 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - **LiteLLM won't start / `prisma` or connection errors** — check
   `docker compose logs postgres litellm`. The bundled Postgres must be healthy
   before LiteLLM migrates.
+- **Redis cache is unavailable** — check `docker compose logs redis litellm`,
+  then verify the bundled Redis service from inside the compose project:
+
+  ```sh
+  docker compose exec redis sh -c 'REDISCLI_AUTH=$REDIS_PASSWORD redis-cli ping'
+  ```
+
+  A healthy container reports `PONG`. LiteLLM's `/cache/ping` diagnostic is
+  blocked on `:11437` because it accepts any valid virtual key and performs a
+  Redis read/write test; use the command above instead. Cache hits on API
+  requests include an `x-litellm-cache-key` response header.
 - **`bind source path does not exist: .../models.generated.yaml`** — run
   `scripts/apply-model-routing.sh` (the mount uses `create_host_path: false`
   so Docker cannot silently create a directory there). On a new install
@@ -717,6 +750,13 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - **`:11437` is authenticated** — LiteLLM rejects requests without a valid
   virtual key. Keep `LITELLM_MASTER_KEY` for administration only. llama.cpp
   itself is not published.
+- **Response cache entries are scoped per virtual key.** `overwrite_user_with_key_hash`
+  stamps each request with the authenticated key identity before cache lookup, so
+  two different virtual keys cannot share cached completions even when the
+  prompt and model settings match.
+- **LiteLLM `/cache/*` diagnostics are blocked on `:11437`.** Those routes accept
+  any valid virtual key and can mutate Redis; nginx returns `403` and operators
+  should use `docker compose exec redis ...` instead (see troubleshooting).
 - **`.env` holds the master key and the UI password.** It is gitignored and
   `scripts/setup-litellm-stack.sh` creates it with mode `600`. Spend logs live
   in the bundled Postgres volume.
@@ -726,12 +766,12 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
   root-owned.
 - Prompt and response *metadata* (not content) also leaves the host for your
   OTEL collector if you enable it.
-- **The routers are not reachable by anything but LiteLLM.** A flat network
+- **The routers, database and cache are not reachable by clients.** A flat network
   would make the gateway optional: `llama-server` has no authentication and
   listens on `0.0.0.0:8080`, so any peer — including `webui`, which runs
   model-driven tool calls — could call `http://llama-1:8080/v1/...` directly
   and bypass auth, per-key rate limits, accounting and the concurrency cap.
-  The overlay therefore splits the flat `llama` network into four segments:
+  The overlay therefore splits the flat `llama` network into five segments:
 
   | Network    | Members                                          | Egress |
   | ---------- | ------------------------------------------------ | ------ |
@@ -739,12 +779,13 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
   | `llama`    | `nginx`, `socat-litellm`, `litellm`              | yes    |
   | `backend`  | `llama-1`, `llama-2`, `socat-1/2`, `litellm`     | no (`internal`) |
   | `db`       | `postgres`, `litellm`                            | no (`internal`) |
+  | `cache`    | `redis`, `litellm`                               | no (`internal`) |
 
   `litellm` is the only service spanning segments. The webui reaches the API
   the same way an external client does — TLS via `host.docker.internal:11437`
   — so it needs no route to the routers or the database.
 - **Supporting images are pinned by digest** (`litellm`, `nginx`, `postgres`,
-  `alpine/socat`) so a registry retag cannot change them on restart. The
+  `redis`, `alpine/socat`) so a registry retag cannot change them on restart. The
   llama.cpp image deliberately stays on the rolling `server-cuda` tag; see the
   comment in `docker-compose.yml` for how to pin it too.
 

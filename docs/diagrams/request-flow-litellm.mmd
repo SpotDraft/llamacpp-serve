@@ -4,6 +4,7 @@ sequenceDiagram
     participant N as nginx :11437 (TLS)
     participant LL as litellm :4000
     participant PG as bundled Postgres
+    participant RC as bundled Redis cache
     participant R as llama-server router
     participant M as model files<br/>(var/lib/llama)
     participant P as child llama-server<br/>(model X)
@@ -17,16 +18,22 @@ sequenceDiagram
     end
     LL->>LL: enforce key RPM/TPM,<br/>max_parallel_requests,<br/>global_max_parallel_requests
     note over LL: over the cap? queue here,<br/>not on the GPU
-    LL->>R: send to the model pinned router
-    note over LL,R: one api_base per GGUF: always this router
-    R->>R: route by "model" field
-    alt model X not loaded
-        R->>M: read GGUF, spawn child
-        M-->>R: model X loaded
+    LL->>RC: look up exact request
+    alt cache hit
+        RC-->>LL: cached response
+    else cache miss
+        LL->>R: send to the model pinned router
+        note over LL,R: one api_base per GGUF: always this router
+        R->>R: route by "model" field
+        alt model X not loaded
+            R->>M: read GGUF, spawn child
+            M-->>R: model X loaded
+        end
+        R->>P: proxy to child
+        P-->>R: SSE stream
+        R-->>LL: stream
+        LL->>RC: store response with 1h TTL
     end
-    R->>P: proxy to child
-    P-->>R: SSE stream
-    R-->>LL: stream
     LL-->>N: stream
     N-->>C: SSE stream (proxy_buffering off)
     LL->>PG: spend log (batched every 60s)

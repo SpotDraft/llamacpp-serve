@@ -18,18 +18,36 @@ postgres_volume_exists() {
 }
 
 MIGRATED=0
+
+is_placeholder_env_value() {
+    candidate="$1"
+    case "$candidate" in
+        ""|CHANGE-ME|sk-CHANGE-ME|changeme|CHANGEME)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 ensure_env() {
     key="$1"
     value="$2"
-    if grep -qE "^${key}=.+" .env 2>/dev/null; then
+    existing=$(sed -n "s|^${key}=\\(.*\\)$|\\1|p" .env 2>/dev/null | head -1)
+    if [ -n "$existing" ] && ! is_placeholder_env_value "$existing"; then
         return 0
     fi
-    if grep -qE "^${key}=$" .env 2>/dev/null; then
-        sed -i.bak "/^${key}=$/d" .env
+    if grep -qE "^${key}=" .env 2>/dev/null; then
+        sed -i.bak "/^${key}=/d" .env
         rm -f .env.bak
     fi
     printf '%s=%s\n' "$key" "$value" >> .env
-    echo "  + added $key"
+    if [ -n "$existing" ]; then
+        echo "  ~ replaced placeholder $key"
+    else
+        echo "  + added $key"
+    fi
     MIGRATED=1
 }
 
@@ -38,6 +56,7 @@ if [ ! -f .env ]; then
     MASTER_KEY="sk-$(openssl rand -hex 24)"
     SALT_KEY="$(openssl rand -hex 24)"
     UI_PASSWORD="$(openssl rand -hex 12)"
+    REDIS_PASSWORD="$(openssl rand -hex 24)"
     if postgres_volume_exists; then
         DB_PASSWORD="litellm"
         echo "Existing postgres-data volume found; using its historical default password."
@@ -52,6 +71,7 @@ if [ ! -f .env ]; then
       -e "s|^UI_PASSWORD=.*|UI_PASSWORD=$UI_PASSWORD|" \
       -e "s|^LITELLM_WEBUI_KEY=.*|LITELLM_WEBUI_KEY=$MASTER_KEY|" \
       -e "s|^LITELLM_DB_PASSWORD=.*|LITELLM_DB_PASSWORD=$DB_PASSWORD|" \
+      -e "s|^LITELLM_REDIS_PASSWORD=.*|LITELLM_REDIS_PASSWORD=$REDIS_PASSWORD|" \
       .env.example > .env
     chmod 600 .env
     echo ".env created with generated LiteLLM secrets."
@@ -67,6 +87,8 @@ else
     ensure_env LITELLM_WEBUI_KEY "$EXISTING_MASTER"
     ensure_env STORE_MODEL_IN_DB "True"
     ensure_env LITELLM_DB_PASSWORD "litellm"
+    ensure_env LITELLM_REDIS_PASSWORD "$(openssl rand -hex 24)"
+    ensure_env LITELLM_REDIS_MAXMEMORY "1gb"
     chmod 600 .env
 
     if [ "$MIGRATED" -eq 1 ]; then
@@ -80,6 +102,20 @@ DB_PASSWORD=$(sed -n 's|^LITELLM_DB_PASSWORD=\(.\{1,\}\)$|\1|p' .env | head -1)
 case "$DB_PASSWORD" in
     ""|*[!A-Za-z0-9._~-]*)
         echo "error: LITELLM_DB_PASSWORD must contain only URL-safe characters" >&2
+        echo "error: generate one with: openssl rand -hex 24" >&2
+        exit 1
+        ;;
+esac
+
+REDIS_PASSWORD=$(sed -n 's|^LITELLM_REDIS_PASSWORD=\(.\{1,\}\)$|\1|p' .env | head -1)
+if is_placeholder_env_value "$REDIS_PASSWORD"; then
+    echo "error: LITELLM_REDIS_PASSWORD is missing or still set to a placeholder" >&2
+    echo "error: re-run this script to generate one, or set it in .env" >&2
+    exit 1
+fi
+case "$REDIS_PASSWORD" in
+    *[!A-Za-z0-9._~-]*)
+        echo "error: LITELLM_REDIS_PASSWORD must contain only URL-safe characters" >&2
         echo "error: generate one with: openssl rand -hex 24" >&2
         exit 1
         ;;
@@ -105,3 +141,7 @@ echo "Next:"
 echo "  1. Set COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml in .env"
 echo "  2. docker compose up --build -d"
 echo "  3. Open https://localhost:11437/ui with UI_USERNAME / UI_PASSWORD"
+echo ""
+echo "Upgrading an existing LiteLLM overlay? Re-run this script before the first"
+echo "restart after pulling Redis support; docker compose needs LITELLM_REDIS_PASSWORD"
+echo "in .env before it can parse docker-compose.litellm.yml."

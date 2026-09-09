@@ -6,6 +6,7 @@ sequenceDiagram
     participant W as Open WebUI :8080
     participant N1 as nginx :11437 (TLS)
     participant LL as litellm :4000
+    participant RC as bundled Redis cache
     participant L as llama-server router<br/>(child model)
 
     B->>N2: https://localhost:11438 (UI + SSE)
@@ -14,7 +15,13 @@ sequenceDiagram
     W->>N1: OPENAI_API_BASE_URL https://host.docker.internal:11437/v1<br/>Bearer LITELLM_WEBUI_KEY
     N1->>LL: proxy via litellm.sock
     LL->>LL: auth + limits for the WebUI's own key
-    LL->>L: pinned router for that model, TCP :8080
-    L-->>LL: SSE / JSON
+    LL->>RC: look up exact request
+    alt cache hit
+        RC-->>LL: cached response
+    else cache miss
+        LL->>L: pinned router for that model, TCP :8080
+        L-->>LL: SSE / JSON
+        LL->>RC: store response with 1h TTL
+    end
     LL-->>W: stream
     W-->>B: stream (buffering off)
