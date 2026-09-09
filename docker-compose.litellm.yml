@@ -3,7 +3,8 @@
 #   docker compose -f docker-compose.yml -f docker-compose.litellm.yml up -d
 #   # or append :docker-compose.litellm.yml to COMPOSE_FILE in .env
 #
-# Run scripts/setup-litellm-stack.sh before the first start.
+# Run scripts/setup-litellm-stack.sh before the first start, and again before
+# the first restart after pulling Redis support on an existing overlay.
 # Postgres and Redis are bundled (no host ports).
 
 services:

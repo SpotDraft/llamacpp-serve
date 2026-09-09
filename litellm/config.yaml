@@ -31,6 +31,11 @@ litellm_settings:
   # additional_drop_params (see generate-litellm-model-config.sh).
   drop_params: true
 
+  # Stamp each request with the authenticated virtual key (or the master-key
+  # alias) as the OpenAI `user` field. Exact-match cache keys include `user`,
+  # so different virtual keys cannot reuse one another's cached responses.
+  overwrite_user_with_key_hash: true
+
   # Cache exact-match chat/completion and Responses API results in the bundled
   # Redis service. The one-hour TTL bounds staleness, while Redis itself also
   # has an LRU memory cap. Clients can force a fresh response with

@@ -272,6 +272,11 @@ first login; the generated master key should be used only for administration.
 - **LiteLLM stack:** after adding or removing a GGUF, run
   `scripts/apply-model-routing.sh`. It updates placement and restarts the
   routers and LiteLLM in place.
+- **Upgrading an existing LiteLLM overlay** (for example after pulling Redis
+  support): run `scripts/setup-litellm-stack.sh --auto --yes` *before* the first
+  `docker compose up`. The overlay requires `LITELLM_REDIS_PASSWORD` in `.env`
+  during Compose parsing; the setup script generates or migrates it idempotently
+  and replaces any `CHANGE-ME` placeholder left from `.env.example`.
 - Inspect status with `docker compose ps` and logs with
   `docker compose logs -f`.
 - Stop and remove containers with `docker compose down`. Runtime data, models
@@ -456,6 +461,11 @@ Caching is on by default for chat/completion and Responses calls. Add
 `"cache": {"no-store": true}` to keep a response out of Redis. These controls
 are LiteLLM request fields and do not need changes to llama.cpp.
 
+`overwrite_user_with_key_hash: true` in `litellm/config.yaml` stamps each
+request with the authenticated virtual key (or the master-key alias) as the
+OpenAI `user` field. Exact-match cache keys include `user`, so different
+virtual keys cannot reuse one another's cached responses.
+
 Stock OpenAI clients can connect unmodified (`/v1/chat/completions`,
 `/v1/models`). That is not full Responses compatibility. Each generated
 deployment sets `use_chat_completions_api: true` and
@@ -606,6 +616,7 @@ and is not wired up here; the OTEL exporter covers the same ground for free.
 | `store_model_in_db: true`           | `litellm/config.yaml`   | Persists models in Postgres so the Admin UI can add/edit them |
 | `background_health_checks: false`   | `litellm/config.yaml`   | **Leave off** — it would load every GGUF on a timer |
 | `cache_params.ttl: 3600`            | `litellm/config.yaml`   | Exact-match response cache lifetime in seconds |
+| `overwrite_user_with_key_hash: true`| `litellm/config.yaml`   | Isolates cache entries per authenticated virtual key |
 | `LITELLM_REDIS_MAXMEMORY=1gb`       | `.env`                  | Redis memory ceiling; entries use LRU eviction |
 | `MAX_PARALLEL` (default 2)          | model config generator | Per-deployment concurrency; defaults to `LLAMA_N_PARALLEL` |
 | `use_chat_completions_api: true`    | generated per model     | Bridges `/v1/responses` to llama.cpp `/chat/completions` |
@@ -696,17 +707,16 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
   `docker compose logs postgres litellm`. The bundled Postgres must be healthy
   before LiteLLM migrates.
 - **Redis cache is unavailable** — check `docker compose logs redis litellm`,
-  then query LiteLLM's authenticated diagnostic endpoint:
+  then verify the bundled Redis service from inside the compose project:
 
   ```sh
-  KEY=$(grep '^LITELLM_MASTER_KEY=' .env | cut -d= -f2)
-  curl -k -H "Authorization: Bearer $KEY" \
-    https://localhost:11437/cache/ping
+  docker compose exec redis sh -c 'REDISCLI_AUTH=$REDIS_PASSWORD redis-cli ping'
   ```
 
-  A healthy response reports `"cache_type":"redis"`, `"ping_response":true`
-  and `"set_cache_response":"success"`. Cache hits include an
-  `x-litellm-cache-key` response header.
+  A healthy container reports `PONG`. LiteLLM's `/cache/ping` diagnostic is
+  blocked on `:11437` because it accepts any valid virtual key and performs a
+  Redis read/write test; use the command above instead. Cache hits on API
+  requests include an `x-litellm-cache-key` response header.
 - **`bind source path does not exist: .../models.generated.yaml`** — run
   `scripts/apply-model-routing.sh` (the mount uses `create_host_path: false`
   so Docker cannot silently create a directory there). On a new install
@@ -740,6 +750,13 @@ mode would load every GGUF into VRAM on a timer and LRU-thrash the GPU.
 - **`:11437` is authenticated** — LiteLLM rejects requests without a valid
   virtual key. Keep `LITELLM_MASTER_KEY` for administration only. llama.cpp
   itself is not published.
+- **Response cache entries are scoped per virtual key.** `overwrite_user_with_key_hash`
+  stamps each request with the authenticated key identity before cache lookup, so
+  two different virtual keys cannot share cached completions even when the
+  prompt and model settings match.
+- **LiteLLM `/cache/*` diagnostics are blocked on `:11437`.** Those routes accept
+  any valid virtual key and can mutate Redis; nginx returns `403` and operators
+  should use `docker compose exec redis ...` instead (see troubleshooting).
 - **`.env` holds the master key and the UI password.** It is gitignored and
   `scripts/setup-litellm-stack.sh` creates it with mode `600`. Spend logs live
   in the bundled Postgres volume.

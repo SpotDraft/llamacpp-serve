@@ -40,7 +40,7 @@ docker compose logs litellm | tail -50
 cat var/run/litellm/models.generated.yaml
 KEY=$(grep '^LITELLM_MASTER_KEY=' .env | cut -d= -f2)
 curl -k -H "Authorization: Bearer $KEY" https://localhost:11437/v1/models
-curl -k -H "Authorization: Bearer $KEY" https://localhost:11437/cache/ping
+docker compose exec redis sh -c 'REDISCLI_AUTH=$REDIS_PASSWORD redis-cli ping'
 curl -sk --max-time 3 -o /dev/null -w '%{http_code}\n' https://localhost:11438/
 ```
 
@@ -106,7 +106,10 @@ with `COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml`.
 - **Redis response caching is exact-match and enabled by default** for
   chat/completion and Responses calls, with a one-hour TTL. Redis is
   authenticated, AOF-backed, memory-capped, and reachable only by LiteLLM.
+  `overwrite_user_with_key_hash: true` isolates cache entries per virtual key.
   Preserve per-request `no-cache` and `no-store` controls when changing it.
+  Block `/cache/*` on `:11437` in `nginx/nginx.litellm.conf`; diagnose Redis
+  with `docker compose exec redis ...` instead of LiteLLM's `/cache/ping`.
 - **The overlay splits the flat `llama` network into five segments**
   (`frontend` / `llama` / `backend` / `db` / `cache`; the last three are
   `internal`).

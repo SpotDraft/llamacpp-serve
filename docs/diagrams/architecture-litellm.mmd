@@ -9,23 +9,35 @@ flowchart TD
             CERTS["TLS certs<br/>nginx/certs/"]
         end
 
-        subgraph NET["bridge network llama"]
+        subgraph NETLLAMA["network llama"]
             SL["socat-litellm<br/>litellm.sock"]
             LL["<b>litellm</b> :4000<br/>auth - limits - cache - pinning"]
+        end
+
+        subgraph NETFRONT["network frontend"]
+            W["webui<br/>:8080"]
+            SW["socat-webui<br/>webui.sock"]
+        end
+
+        subgraph NETBACK["network backend (internal)"]
             subgraph POOL["llama.cpp - 4 GGUFs max, not published"]
                 L1["llama-1<br/>up to 2 assigned models"]
                 L2["llama-2<br/>up to 2 assigned models"]
             end
-            W["webui<br/>:8080"]
-            SW["socat-webui<br/>webui.sock"]
+        end
+
+        subgraph NETDB["network db (internal)"]
+            PG[("bundled Postgres")]
+        end
+
+        subgraph NETCACHE["network cache (internal)"]
+            REDIS[("bundled Redis<br/>response cache")]
         end
 
         GPU["NVIDIA GB10 GPU"]
         MODELS["var/lib/llama"]
         GEN["models.generated.yaml"]
         DATA["var/lib/webui"]
-        PG[("bundled Postgres")]
-        REDIS[("bundled Redis<br/>response cache")]
     end
 
     CLI1 -->|TLS| LS11437

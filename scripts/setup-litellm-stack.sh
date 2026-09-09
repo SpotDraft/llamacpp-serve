@@ -18,18 +18,36 @@ postgres_volume_exists() {
 }
 
 MIGRATED=0
+
+is_placeholder_env_value() {
+    candidate="$1"
+    case "$candidate" in
+        ""|CHANGE-ME|sk-CHANGE-ME|changeme|CHANGEME)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 ensure_env() {
     key="$1"
     value="$2"
-    if grep -qE "^${key}=.+" .env 2>/dev/null; then
+    existing=$(sed -n "s|^${key}=\\(.*\\)$|\\1|p" .env 2>/dev/null | head -1)
+    if [ -n "$existing" ] && ! is_placeholder_env_value "$existing"; then
         return 0
     fi
-    if grep -qE "^${key}=$" .env 2>/dev/null; then
-        sed -i.bak "/^${key}=$/d" .env
+    if grep -qE "^${key}=" .env 2>/dev/null; then
+        sed -i.bak "/^${key}=/d" .env
         rm -f .env.bak
     fi
     printf '%s=%s\n' "$key" "$value" >> .env
-    echo "  + added $key"
+    if [ -n "$existing" ]; then
+        echo "  ~ replaced placeholder $key"
+    else
+        echo "  + added $key"
+    fi
     MIGRATED=1
 }
 
@@ -89,6 +107,20 @@ case "$DB_PASSWORD" in
         ;;
 esac
 
+REDIS_PASSWORD=$(sed -n 's|^LITELLM_REDIS_PASSWORD=\(.\{1,\}\)$|\1|p' .env | head -1)
+if is_placeholder_env_value "$REDIS_PASSWORD"; then
+    echo "error: LITELLM_REDIS_PASSWORD is missing or still set to a placeholder" >&2
+    echo "error: re-run this script to generate one, or set it in .env" >&2
+    exit 1
+fi
+case "$REDIS_PASSWORD" in
+    *[!A-Za-z0-9._~-]*)
+        echo "error: LITELLM_REDIS_PASSWORD must contain only URL-safe characters" >&2
+        echo "error: generate one with: openssl rand -hex 24" >&2
+        exit 1
+        ;;
+esac
+
 if [ "$(id -u)" -eq 0 ]; then
     chown 1000:1000 .env
     chown -R 1000:1000 var/run/litellm
@@ -109,3 +141,7 @@ echo "Next:"
 echo "  1. Set COMPOSE_FILE=docker-compose.yml:docker-compose.litellm.yml in .env"
 echo "  2. docker compose up --build -d"
 echo "  3. Open https://localhost:11437/ui with UI_USERNAME / UI_PASSWORD"
+echo ""
+echo "Upgrading an existing LiteLLM overlay? Re-run this script before the first"
+echo "restart after pulling Redis support; docker compose needs LITELLM_REDIS_PASSWORD"
+echo "in .env before it can parse docker-compose.litellm.yml."
